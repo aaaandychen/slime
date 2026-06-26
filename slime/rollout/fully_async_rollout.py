@@ -45,6 +45,35 @@ __all__ = [
 logger = logging.getLogger("slime.rollout.fully_async")
 
 
+def _has_aborted(result: list) -> bool:
+    """Check whether *result* contains any ABORTED sample.
+
+    Recurse into nested lists so fan-out returns from
+    ``--custom-generate-function-path`` (``list[list[Sample]]``) are handled
+    correctly.
+    """
+    for item in result:
+        if isinstance(item, list):
+            if _has_aborted(item):
+                return True
+        elif getattr(item, "status", None) == Sample.Status.ABORTED:
+            return True
+    return False
+
+
+def _normalize_groups(result: list) -> list[list[Sample]]:
+    """Return *result* as ``list[list[Sample]]`` suitable for ``data_buffer.add_samples``.
+
+    ``generate_and_rm_group`` returns ``list[Sample]`` for plain rollouts
+    and ``list[list[Sample]]`` when a custom generate function fans out
+    multiple segments per trajectory.  ``add_samples`` always expects a
+    list of groups.
+    """
+    if result and isinstance(result[0], list):
+        return result  # already list[list[Sample]] (fan-out)
+    return [result]  # plain list[Sample] → wrap
+
+
 # Global worker, shared across rollout calls so the queue stays warm.
 _global_worker: AsyncRolloutWorker | None = None
 _worker_lock = threading.Lock()
@@ -180,9 +209,9 @@ class AsyncRolloutWorker:
                 )
                 return
             # Aborted group → requeue, don't ship to training.
-            if any(getattr(s, "status", None) == Sample.Status.ABORTED for s in result):
+            if _has_aborted(result):
                 try:
-                    self.data_buffer.add_samples([result])
+                    self.data_buffer.add_samples(_normalize_groups(result))
                 except Exception:  # noqa: BLE001
                     logger.exception("fully-async: failed to requeue aborted group")
                 return
@@ -231,12 +260,12 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             last_log = now
 
     # Order by sample.index for determinism (slime convention).
-    def _key(group: list[Sample]) -> int:
-        for s in group:
-            idx = getattr(s, "index", None)
-            if idx is not None:
-                return int(idx)
-        return 0
+    # Fan-out: group[0] may be list[Sample] rather than Sample.
+    def _key(group) -> int:
+        first = group[0]
+        if isinstance(first, list):
+            return int(first[0].index) if first else 0
+        return int(first.index) if first else 0
 
     out = sorted(collected.values(), key=_key)[:target]
     logger.info(

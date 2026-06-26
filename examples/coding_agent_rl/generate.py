@@ -188,6 +188,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
         max_context_tokens=state.max_context_len,
     )
     t0 = time.time()
+    samples = None
+
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id) as sb:
@@ -243,7 +245,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
 
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0, instance_id)
-        return _abort_result(base_sample, "wall_clock_timeout", instance_id)
     except Exception as e:
         logger.warning(
             "[coding_agent_rl] %s: rollout failed: %s\n%s",
@@ -251,9 +252,28 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any]):
             e,
             traceback.format_exc(),
         )
-        return _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
     finally:
         await state.adapter.drop_session(session_id)  # cleanup only, idempotent
+
+    # ---- abort path: salvage partial trajectory samples from the adapter ----
+    if samples is None:
+        try:
+            samples = await state.adapter.finish_session(
+                session_id, base_sample=base_sample, reward=0.0,
+            )
+        except Exception:
+            samples = []
+
+    if samples:
+        for s in samples:
+            s.status = Sample.Status.ABORTED
+            s.metadata = {
+                **(s.metadata or {}),
+                "abort_reason": "wall_clock_timeout",
+            }
+        return samples
+
+    return _abort_result(base_sample, "wall_clock_timeout", instance_id)
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:
