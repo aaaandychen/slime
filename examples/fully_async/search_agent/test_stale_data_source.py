@@ -6,13 +6,22 @@ Usage::
 """
 
 import asyncio
+import os
 import sys
 import threading
 import time
 from argparse import Namespace
 from unittest import mock
 
-from examples.fully_async.search_agent.stale_data_source import StalenessDataSource
+# Ensure the current directory is on sys.path so that 'stale_data_source' can be imported
+# when this script is run directly with `python examples/fully_async/search_agent/test_stale_data_source.py`.
+try:
+    _current_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _current_dir = os.getcwd()
+sys.path.insert(0, _current_dir)
+
+from stale_data_source import StalenessDataSource
 
 
 def _make_args(**overrides):
@@ -49,9 +58,10 @@ def test_blocks_when_threshold_exceeded():
     result = []
 
     def take():
+        ds.get_samples(1)
         result.append("done")
 
-    t = threading.Thread(target=lambda: (take(), ds.get_samples(1)), daemon=True)
+    t = threading.Thread(target=take, daemon=True)
     t.start()
     time.sleep(0.3)
     assert t.is_alive(), "should be blocked"
@@ -100,7 +110,9 @@ def test_counter_resets_after_unblock():
     t.join(timeout=2.0)
     result.clear()
 
-    for _ in range(4):
+    # After reset, the thread above consumed 1 group → counter is already at 1.
+    # 3 more calls bring it to 4 and clear the event.
+    for _ in range(3):
         ds.get_samples(1)
 
     t2 = threading.Thread(target=lambda: result.append(ds.get_samples(1)), daemon=True)
@@ -187,19 +199,31 @@ def test_worker_pauses_and_resumes():
         await asyncio.sleep(0.01)
         return group
 
-    # Patch the worker's generate function with our mock
+    # Patch the worker's generate function and GenerateState with our mocks.
+    # GenerateState.__init__ tries to load a tokenizer from HF; we stub it out
+    # entirely since the worker only uses state.sampling_params.copy().
+    class _MockState:
+        def __init__(self, args):
+            self.sampling_params = {}
+
     with (
         mock.patch.object(_fr, "generate_and_rm_group", fake_generate_and_rm_group),
-        mock.patch.object(_fr, "get_rollout_num_engines", lambda _a: 1),
+        mock.patch.object(_fr, "GenerateState", _MockState),
     ):
         worker = _fr.AsyncRolloutWorker(args, ds, concurrency=2)
         worker.start()
 
-        time.sleep(1.0)
+        # Worker loop: 1s sleep per iteration, 2 tasks per iteration.
+        # Iter 1: 2 tasks → counter=2. Iter 2: 2 tasks → counter=4 → CLEAR.
+        # Iter 3: get_samples blocks.  Total ~2s wall time.
+        # Sleep 3s so all 4 tasks complete and hit the staleness block.
+        time.sleep(3.0)
 
+        # First drain — all 4 completed before staleness kicked in.
         completed = worker.get_completed_groups()
         assert len(completed) > 0, f"expected >0 completed groups, got {len(completed)}"
 
+        # After pause, no new groups should appear.
         time.sleep(0.5)
         completed2 = worker.get_completed_groups()
         assert len(completed2) == 0, (
@@ -207,10 +231,13 @@ def test_worker_pauses_and_resumes():
         )
 
         ds.reset_staleness()
+        # After reset, worker unblocks and creates new tasks (each 0.01s mock).
         time.sleep(1.0)
         completed3 = worker.get_completed_groups()
         assert len(completed3) > 0, f"Worker should resume after reset, got {len(completed3)}"
 
+        # Unblock the worker before stopping to avoid a stuck join().
+        ds.reset_staleness()
         worker.stop()
 
     print("  PASS test_worker_pauses_and_resumes")
