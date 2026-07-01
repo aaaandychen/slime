@@ -115,6 +115,12 @@ class AsyncRolloutWorker:
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
 
+        # Staleness control: cap how many groups the worker can generate before
+        # the next weight sync, so samples aren't trained on stale parameters.
+        self.staleness_threshold: int = getattr(args, "staleness_threshold", 1)
+        self.max_required_samples: int = int((1 + self.staleness_threshold) * args.rollout_batch_size)
+        self.staleness_samples: int = 0
+
     # -- public --------------------------------------------------------------
 
     def start(self) -> None:
@@ -127,9 +133,16 @@ class AsyncRolloutWorker:
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=5)
 
-    def get_completed_groups(self) -> list[tuple[int, list[Sample]]]:
+    def get_completed_groups(self, max_groups: int | None = None) -> list[tuple[int, list[Sample]]]:
+        """Drain completed groups from the output queue.
+
+        When *max_groups* is set, returns at most that many groups and leaves
+        the rest in the queue for the next call.
+        """
         completed: list[tuple[int, list[Sample]]] = []
         while True:
+            if max_groups is not None and len(completed) >= max_groups:
+                break
             try:
                 completed.append(self.output_queue.get_nowait())
             except queue.Empty:
@@ -138,6 +151,19 @@ class AsyncRolloutWorker:
 
     def queue_size(self) -> int:
         return self.output_queue.qsize()
+
+    def reset_staleness(self) -> None:
+        """Reset staleness counter after weight sync.
+
+        Called after ``update_weights()`` so the worker can resume generation
+        with freshened parameters.
+        """
+        self.staleness_samples = 0
+        logger.info(
+            "fully-async: staleness counter reset (threshold=%d max_required=%d)",
+            self.staleness_threshold,
+            self.max_required_samples,
+        )
 
     # -- internals -----------------------------------------------------------
 
@@ -163,6 +189,10 @@ class AsyncRolloutWorker:
 
                 # Top up.
                 while len(active_tasks) < max_concurrent and self.running:
+                    # Staleness cap: stop pulling when we've generated enough samples
+                    # for this weight-sync interval.
+                    if self.staleness_samples >= self.max_required_samples:
+                        break
                     groups = self.data_buffer.get_samples(1)
                     if not groups:
                         break
@@ -215,6 +245,7 @@ class AsyncRolloutWorker:
                 except Exception:  # noqa: BLE001
                     logger.exception("fully-async: failed to requeue aborted group")
                 return
+            self.staleness_samples += 1
             self.output_queue.put((gid, result))
 
         return _cb
@@ -238,9 +269,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     LOG_EVERY = 30.0
 
     while len(collected) < target:
-        # Pull whatever's done.
+        # Pull only what we still need; leftovers stay in the queue for
+        # the next rollout round instead of being discarded.
+        needed = target - len(collected)
         drained = 0
-        for gid, group in worker.get_completed_groups():
+        for gid, group in worker.get_completed_groups(max_groups=needed):
             collected[gid] = group
             drained += 1
 
@@ -269,10 +302,12 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
 
     out = sorted(collected.values(), key=_key)[:target]
     logger.info(
-        "fully-async rollout %d: done in %.1fs, queue_left=%d",
+        "fully-async rollout %d: done in %.1fs, queue_left=%d staleness=%d/%d",
         rollout_id,
         time.time() - started,
         worker.queue_size(),
+        worker.staleness_samples,
+        worker.max_required_samples,
     )
     return out
 

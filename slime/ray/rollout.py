@@ -578,10 +578,16 @@ class RolloutManager:
     def reset_staleness(self):
         """Reset staleness counter after weight sync (fully-async mode).
 
-        No-op when the data source does not track staleness.
+        Resets both the external data source (if it tracks staleness) and the
+        global fully-async worker so generation resumes with freshened weights.
         """
         if hasattr(self.data_source, "reset_staleness"):
             self.data_source.reset_staleness()
+
+        from slime.rollout.fully_async_rollout import _global_worker
+
+        if _global_worker is not None:
+            _global_worker.reset_staleness()
 
     def offload(self):
         self.health_monitoring_pause()
