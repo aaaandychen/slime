@@ -11,12 +11,19 @@ Run with: python test_staleness_integration.py
 """
 
 import sys
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, ".")
 
-from slime.utils.types import Sample
-from slime.rollout.fully_async_rollout import AsyncRolloutWorker
+# Mock GenerateState before import — it tries to load a tokenizer from disk
+_mock_gs = MagicMock()
+_mock_gs.sampling_params = {}
+
+with patch("slime.rollout.sglang_rollout.GenerateState") as _MockGS:
+    _MockGS.return_value = _mock_gs
+
+    from slime.utils.types import Sample
+    from slime.rollout.fully_async_rollout import AsyncRolloutWorker
 
 
 # ── helpers ──────────────────────────────────────────────────────────

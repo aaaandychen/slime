@@ -3,14 +3,21 @@
 Run with: python test_staleness_unit.py
 """
 
-import queue
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, ".")
 
-from slime.utils.types import Sample
-from slime.rollout.fully_async_rollout import AsyncRolloutWorker
+# Mock GenerateState before import — it tries to load a tokenizer from disk
+# which is not available in unit test environments.
+mock_generate_state = MagicMock()
+mock_generate_state.sampling_params = {}
+
+with patch("slime.rollout.sglang_rollout.GenerateState") as MockGS:
+    MockGS.return_value = mock_generate_state
+
+    from slime.utils.types import Sample
+    from slime.rollout.fully_async_rollout import AsyncRolloutWorker
 
 
 class FakeArgs:
@@ -95,7 +102,6 @@ def test_loop_stops_when_quota_exhausted():
     worker.staleness_samples = 24
     worker.max_required_samples = 24
 
-    # Simulate the _loop's Top up condition
     should_pull = worker.staleness_samples < worker.max_required_samples
     assert not should_pull  # should NOT pull
     print("PASS test_loop_stops_when_quota_exhausted")
@@ -113,9 +119,11 @@ def test_loop_pulls_when_within_quota():
 
 def test_max_required_samples_default():
     """When staleness_threshold not set, defaults to 1."""
-    args = FakeArgs()
-    del args.staleness_threshold  # simulate not set
-    args.staleness_threshold = 1   # getattr default
+    # Create a plain object without staleness_threshold on the class
+    args = MagicMock(spec=["rollout_batch_size", "sglang_server_concurrency"])
+    args.rollout_batch_size = 8
+    args.sglang_server_concurrency = 1
+    # getattr(args, "staleness_threshold", 1) will return 1
     worker = AsyncRolloutWorker(args, MagicMock(), concurrency=4)
     assert worker.max_required_samples == (1 + 1) * 8  # 16
     print("PASS test_max_required_samples_default")
