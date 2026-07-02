@@ -32,6 +32,7 @@ class InteractionResult:
     response: str = ""
     loss_mask: list[int] | None = None
     tokens: int | None = None
+    rollout_log_probs: list[float] | None = None
     status: Status = Status.COMPLETED
 
 
@@ -212,6 +213,7 @@ class TrainableAgentMixin:
         # Initialize tracking variables
         loss_masks = []
         response_token_ids = []
+        rollout_log_probs: list[float] = []
         total_reward = 0.0
 
         # Initialize result
@@ -225,7 +227,7 @@ class TrainableAgentMixin:
             )
             # Reformulate tool call instruction for tau-bench
             text_input = self._reformulate_tool_call(text_input)
-            payload = {"text": text_input, "sampling_params": sampling_params}
+            payload = {"text": text_input, "sampling_params": sampling_params, "return_logprob": True}
 
             # Send request to sglang server
             output = await self._call_llm(url, payload)
@@ -234,7 +236,7 @@ class TrainableAgentMixin:
             if output["meta_info"]["finish_reason"]["type"] == "abort":
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs
                 )
 
             response = output["text"]
@@ -255,7 +257,7 @@ class TrainableAgentMixin:
                     )
                     res.status = Status.ABORTED
                     return self._build_final_result(
-                        res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                        res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs
                     )
 
                 # Extract parsed results
@@ -269,14 +271,31 @@ class TrainableAgentMixin:
                 logger.warning(f"rollout response: {response} can not be parsed into " f"tool calls {e}")
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs
                 )
 
             # Add assistant response to conversation
             messages.append({"role": "assistant", "content": response})
-            assistant_token_ids, assistant_loss_mask = self._get_token_delta(state.tokenizer, messages)
-            response_token_ids.extend(assistant_token_ids)
-            loss_masks.extend(assistant_loss_mask)
+
+            # Use output_token_logprobs from SGLang for accurate token IDs and
+            # logprobs.  This is required for fully-async (off-policy) training
+            # where the rollout logprobs are needed for importance sampling.
+            if "output_token_logprobs" in output["meta_info"]:
+                cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            else:
+                # Fallback: tokenize via text delta when logprobs aren't available
+                # (e.g. older sglang versions).
+                cur_response_token_ids, _ = self._get_token_delta(state.tokenizer, messages)
+                cur_log_probs = [0.0] * len(cur_response_token_ids)
+                logger.warning(
+                    "No output_token_logprobs in response; using zero logprobs for %d tokens",
+                    len(cur_response_token_ids),
+                )
+
+            response_token_ids.extend(cur_response_token_ids)
+            loss_masks.extend([1] * len(cur_response_token_ids))
+            rollout_log_probs.extend(cur_log_probs)
 
             # Execute action in environment
             agent_content, calls = parsed["normal_text"], parsed["calls"]
@@ -291,7 +310,7 @@ class TrainableAgentMixin:
                 logger.warning(f"Error: {e}")
                 res.status = Status.ABORTED
                 return self._build_final_result(
-                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+                    res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs
                 )
 
             logger.debug(f"Environment response: reward={env_response.reward}, " f"done={env_response.done}")
@@ -313,6 +332,7 @@ class TrainableAgentMixin:
             env_token_ids, env_loss_mask = self._get_token_delta(state.tokenizer, messages)
             response_token_ids.extend(env_token_ids)
             loss_masks.extend(env_loss_mask)
+            rollout_log_probs.extend([0.0] * len(env_token_ids))
 
             # Update reward and info
             total_reward = env_response.reward
@@ -328,7 +348,7 @@ class TrainableAgentMixin:
             res.status = Status.TRUNCATED
 
         return self._build_final_result(
-            res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids
+            res, total_reward, info, messages, loss_masks, prompt_token_ids, response_token_ids, rollout_log_probs
         )
 
     def _get_token_delta(self, tokenizer: AutoTokenizer, messages: list[dict]) -> tuple[list[int], list[int]]:
@@ -375,6 +395,7 @@ class TrainableAgentMixin:
         loss_masks: list[int],
         prompt_token_ids: list[int],
         response_token_ids: list[int],
+        rollout_log_probs: list[float] | None = None,
     ) -> InteractionResult:
         """
         Build the final interaction result with all collected data.
@@ -387,6 +408,7 @@ class TrainableAgentMixin:
             loss_masks: Loss masks for training
             prompt_token_ids: Prompt token IDs
             response_token_ids: Response token IDs
+            rollout_log_probs: Per-token log probabilities from rollout
 
         Returns:
             Populated InteractionResult
@@ -398,6 +420,7 @@ class TrainableAgentMixin:
         res.tokens = prompt_token_ids + response_token_ids
         res.response = "".join([msg.get("content", "") for msg in messages if msg["role"] == "assistant"])
         res.response_length = len(loss_masks)
+        res.rollout_log_probs = rollout_log_probs
 
         logger.debug(
             f"_build_final_result: response_length={res.response_length}, "

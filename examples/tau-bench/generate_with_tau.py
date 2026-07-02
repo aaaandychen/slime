@@ -112,13 +112,7 @@ async def generate(args: dict[str, Any], sample: Sample, sampling_params: dict) 
 
     Returns:
         Sample object containing the complete interaction trajectory
-
-    Raises:
-        AssertionError: If partial rollout is requested (not supported)
     """
-    # Validate arguments
-    assert not args.partial_rollout, "Partial rollout is not supported for tau-bench interactions."
-
     # Extract task index from sample prompt
     task_index = int(sample.prompt)
     logger.info(f"Starting agent-environment interaction for task {task_index}")
@@ -148,6 +142,10 @@ async def generate(args: dict[str, Any], sample: Sample, sampling_params: dict) 
 
     # Convert to slime Sample format
     result_sample = res_to_sample(interaction_result, task_index)
+
+    # Carry rollout logprobs for off-policy training (fully-async mode).
+    if interaction_result.rollout_log_probs is not None:
+        result_sample.rollout_log_probs = interaction_result.rollout_log_probs
 
     logger.info(f"Finished agent-environment interaction for task {task_index}")
     return result_sample
