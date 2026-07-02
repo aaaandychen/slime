@@ -23,16 +23,16 @@ logger = logging.getLogger(__name__)
 TAU_CONFIGS = {
     "env": "retail",  # Select between ["retail", "airline"]
     "agent_strategy": "tool-calling",  # Select between ["tool-calling", "act", "react", "few-shot"]
-    "user_model": "gemini-2.5-flash-lite",  # Cheap Model for user simulator
+    "user_model": "deepseek-chat",  # User simulator model
     "task_split": "train",  # Select between ["train", "test", "dev"] for retail
     "user_strategy": "llm",  # Select between ["llm", "react", "verify", "reflection"]
     "model_provider": "auto_router",  # Unused, required
-    "model": "qwen3-4b",  # Unused, required
-    "user_model_provider": "gemini",
+    "model": "qwen3-14b",  # Unused, required
+    "user_model_provider": "deepseek",
 }
-# Replace with your actual API key for user sim
-GEMINI_API_KEY = "NONE"
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+# Replace with your actual DeepSeek API key for user sim
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+os.environ["DEEPSEEK_API_KEY"] = DEEPSEEK_API_KEY
 tau_config = RunConfig(**TAU_CONFIGS)
 
 

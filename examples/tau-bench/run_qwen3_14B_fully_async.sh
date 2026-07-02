@@ -135,7 +135,7 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${SCRIPT_DIR}/../..\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"GEMINI_API_KEY\": \"${GEMINI_API_KEY:-}\"
+    \"DEEPSEEK_API_KEY\": \"${DEEPSEEK_API_KEY:-}\"
   }
 }"
 
