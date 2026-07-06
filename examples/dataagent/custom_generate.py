@@ -38,7 +38,7 @@ async def _query_dataagent(query: str, thread_id: str) -> dict[str, Any]:
     to the correct sample via ``X-DataAgent-Thread-Id``.
     """
     url = f"{DATAAGENT_BASE_URL}/api/stream/search"
-    params = {"agentId": DATAAGENT_AGENT_ID, "query": query, "threadId": thread_id}
+    params = {"agentId": int(os.environ.get("DATAAGENT_AGENT_ID", "20")), "query": query, "threadId": thread_id}
     headers = {"Accept": "text/event-stream"}
 
     nodes: dict[str, dict[str, Any]] = {}  # "nodeName|textType" → {node, type, text}
@@ -98,16 +98,11 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
 
     # Register sample under a unique threadId so handle_chat can find it.
     thread_id = f"slime-{sample.index}-{uuid.uuid4().hex[:8]}"
-    slime_api._thread_samples[thread_id] = sample
+    slime_api._current_sample = sample
 
-    # Ensure mutable lists are initialised before handle_chat starts
-    # appending via append_response_tokens.
+    # Ensure tokens is initialised (handler appends prompt + response).
     if sample.tokens is None:
         sample.tokens = []
-    if sample.rollout_log_probs is None:
-        sample.rollout_log_probs = []
-    if sample.loss_mask is None:
-        sample.loss_mask = []
 
     query = str(sample.prompt).strip()
     logger.info("DataAgent generate: threadId=%s query=%r", thread_id, query[:120])
@@ -118,7 +113,7 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
         logger.exception("DataAgent generate failed: threadId=%s", thread_id)
         sample.status = Sample.Status.FAILED
         sample.reward = 0.0
-        slime_api._thread_samples.pop(thread_id, None)
+        slime_api._current_sample = None
         return sample
 
     # Score the final output.
@@ -130,7 +125,7 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
     sample.metadata["dataagent_thread_id"] = thread_id
     sample.status = Sample.Status.COMPLETED
 
-    slime_api._thread_samples.pop(thread_id, None)
+    slime_api._current_sample = None
     logger.info(
         "DataAgent generate: done (threadId=%s, nodes=%d, reward=%.2f)",
         thread_id,

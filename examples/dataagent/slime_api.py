@@ -15,7 +15,9 @@ Public API::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -29,7 +31,7 @@ from slime.utils.http_utils import post
 logger = logging.getLogger(__name__)
 
 # ── shared state ──────────────────────────────────────────────────────
-_thread_samples: dict[str, Any] = {}  # threadId → Sample  (custom_generate writes directly)
+_current_sample: Any = None  # set by custom_generate before SSE, cleared after
 _args: Any = None
 _server_started = False
 _server_lock = threading.Lock()
@@ -72,17 +74,24 @@ def notify_resume() -> None:
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
     """POST /v1/chat/completions — OpenAI-compatible."""
-    thread_id = request.headers.get("X-DataAgent-Thread-Id", "")
-    sample = _thread_samples.get(thread_id)
+    sample = _current_sample
     if sample is None:
-        return _error(400, f"Unknown threadId: {thread_id!r}")
+        return _error(503, "No active sample — custom_generate has not started an SSE stream yet")
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "Invalid JSON body")
+
     messages = body.get("messages", [])
     tools = body.get("tools")
     max_tokens = body.get("max_tokens", 2048)
 
-    state = GenerateState(_args)
+    try:
+        state = GenerateState(_args)
+    except Exception as e:
+        logger.exception("Failed to create GenerateState")
+        return _error(500, f"Model init error: {e}")
     sampling_params = state.sampling_params.copy()
     sampling_params["max_new_tokens"] = min(max_tokens, sampling_params["max_new_tokens"])
 
@@ -92,16 +101,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     )
     input_ids = state.tokenizer.encode(prompt_text, add_special_tokens=False)
 
-    # Write prompt tokens into the sample as non-trainable context
-    # (loss_mask=0).  The trainer needs them for the forward pass;
-    # without them rollout_logprobs and training-time logprobs misalign.
-    # append_response_tokens unconditionally bumps response_length (even
-    # for trainable=False), so we save & restore to keep it response-only.
-    resp_len_before = sample.response_length or 0
-    sample.append_response_tokens(
-        _args, tokens=input_ids, trainable=False
-    )
-    sample.response_length = resp_len_before
+    # Write prompt tokens into sample.tokens as context for the
+    # trainer's forward pass.  Do NOT touch loss_mask, rollout_log_probs,
+    # or response_length — those only cover model-generated tokens.
+    sample.tokens = (sample.tokens or []) + list(input_ids)
 
     url = f"http://{_args.sglang_router_ip}:{_args.sglang_router_port}/generate"
     payload: dict[str, Any] = {
@@ -110,75 +113,66 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         "return_logprob": True,
     }
 
-    # Generate (with abort-retry for partial rollout).
-    # Concurrency is controlled by generate_and_rm's outer semaphore
-    # (async with state.semaphore) — DataAgent calls are serial within
-    # each Sample, so no inner semaphore is needed here.
-    # We deliberately do NOT engage GenerateState's semaphore or
-    # dp_rank_context here because handle_chat runs in a different
-    # asyncio event loop (daemon thread) than the Worker thread where
-    # those primitives were created.
-    while True:
-        output = await post(url, payload)
+    try:
+        while True:
+            output = await post(url, payload)
 
-        meta = output.get("meta_info", {})
-        finish = meta.get("finish_reason", {}).get("type", "")
+            meta = output.get("meta_info", {})
+            finish = meta.get("finish_reason", {}).get("type", "")
 
-        if finish == "abort":
-            # Weight sync in progress.  Save partial tokens (old
-            # weights) to the sample AND extend input_ids so the
-            # retry continues from where SGLang left off.
-            partial_tokens = _extract_response_tokens(output)
-            if partial_tokens:
-                partial_logprobs = _extract_response_logprobs(output)
-                sample.append_response_tokens(
-                    _args,
-                    tokens=partial_tokens,
-                    log_probs=partial_logprobs,
-                    trainable=True,
-                    meta_info=meta,
-                )
-                input_ids = input_ids + partial_tokens
-                payload["input_ids"] = input_ids
+            if finish == "abort":
+                partial_tokens = _extract_response_tokens(output)
+                if partial_tokens:
+                    partial_logprobs = _extract_response_logprobs(output)
+                    sample.append_response_tokens(
+                        _args,
+                        tokens=partial_tokens,
+                        log_probs=partial_logprobs,
+                        trainable=True,
+                        meta_info=meta,
+                        update_terminal_info=False,
+                    )
+                    input_ids = input_ids + partial_tokens
+                    payload["input_ids"] = input_ids
 
-            target = _resume_generation + 1
-            await _wait_resume(target)
-            continue
+                target = _resume_generation + 1
+                await _wait_resume(target)
+                continue
 
-        break
+            break
 
-    # Append generated tokens (or continuation, if abort-then-retry).
-    new_tokens = _extract_response_tokens(output)
-    if new_tokens:
-        new_logprobs = _extract_response_logprobs(output)
-        sample.append_response_tokens(
-            _args,
-            tokens=new_tokens,
-            log_probs=new_logprobs,
-            trainable=True,
-            meta_info=meta,
-        )
+        new_tokens = _extract_response_tokens(output)
+        if new_tokens:
+            new_logprobs = _extract_response_logprobs(output)
+            sample.append_response_tokens(
+                _args,
+                tokens=new_tokens,
+                log_probs=new_logprobs,
+                trainable=True,
+                meta_info=meta,
+            )
 
-    # Assemble OpenAI-format response
-    text = output.get("text", "")
-    finish_reason = _map_finish_reason(finish)
+        text = _strip_thinking(output.get("text", ""))
+        finish_reason = _map_finish_reason(finish)
+        chunk = json.dumps({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "slime-rl",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": finish_reason,
+            }],
+        })
+    except Exception:
+        logger.exception("handle_chat_completions failed")
+        return _error(500, "Internal server error")
 
-    return web.json_response({
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": "slime-rl",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": finish_reason,
-        }],
-        "usage": {
-            "prompt_tokens": len(input_ids) - len(new_tokens),
-            "completion_tokens": len(new_tokens),
-            "total_tokens": len(input_ids),
-        },
-    })
+    return web.Response(
+        text=f"data: {chunk}\n\ndata: [DONE]\n\n",
+        content_type="text/event-stream",
+    )
 
 
 # ── internals ─────────────────────────────────────────────────────────
@@ -186,6 +180,19 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
 async def _wait_resume(target: int) -> None:
     while _resume_generation < target:
         await asyncio.sleep(0.1)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove ``<think>...</think>`` blocks and special tokens from model output.
+
+    Truncates at ``<|im_end|>`` to avoid trailing junk corrupting JSON/SQL parsers.
+    """
+    # Truncate at the first <|im_end|> — everything after is noise
+    idx = text.find("<|im_end|>")
+    if idx >= 0:
+        text = text[:idx]
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    return text.strip()
 
 
 def _extract_response_tokens(output: dict) -> list[int]:
