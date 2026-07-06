@@ -589,6 +589,16 @@ class RolloutManager:
         if _global_worker is not None:
             _global_worker.reset_staleness()
 
+        # Wake up any slime_api handler blocked on SGLang abort.
+        # Must happen in the Rollout Manager process (same process as
+        # the aiohttp server), NOT in the Trainer process.
+        try:
+            from examples.dataagent import slime_api
+
+            slime_api.notify_resume()
+        except ImportError:
+            pass
+
     def offload(self):
         self.health_monitoring_pause()
         for srv in self.servers.values():
