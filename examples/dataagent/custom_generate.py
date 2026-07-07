@@ -13,12 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-import uuid
 from typing import Any
 
 import httpx
 
 from examples.dataagent import slime_api
+from slime.rollout.fully_async_rollout import _global_worker
 
 logger = logging.getLogger(__name__)
 
@@ -96,11 +96,15 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
     # Ensure the Slime LLM API is running (idempotent, first call starts it).
     slime_api.ensure_server(args)
 
-    # Register sample under a unique threadId so handle_chat can find it.
-    thread_id = f"slime-{sample.index}-{uuid.uuid4().hex[:8]}"
-    slime_api._current_sample = sample
+    # Bridge to the worker's shared dict the first time we run.
+    # After this, handler lookups and our writes use the same dict.
+    if _global_worker is not None:
+        slime_api._sample_map = _global_worker.sample_map
 
-    # Ensure tokens is initialised (handler appends prompt + response).
+    # ThreadId uses slime's built-in monotonically-increasing sample.index.
+    thread_id = f"slime-{sample.index}"
+    slime_api._sample_map[thread_id] = sample
+
     if sample.tokens is None:
         sample.tokens = []
 
@@ -113,10 +117,9 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
         logger.exception("DataAgent generate failed: threadId=%s", thread_id)
         sample.status = Sample.Status.FAILED
         sample.reward = 0.0
-        slime_api._current_sample = None
+        slime_api._sample_map.pop(thread_id, None)
         return sample
 
-    # Score the final output.
     from examples.dataagent.reward_func import score
 
     sample.reward = score(result["nodes"], getattr(sample, "label", ""))
@@ -125,7 +128,7 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
     sample.metadata["dataagent_thread_id"] = thread_id
     sample.status = Sample.Status.COMPLETED
 
-    slime_api._current_sample = None
+    slime_api._sample_map.pop(thread_id, None)
     logger.info(
         "DataAgent generate: done (threadId=%s, nodes=%d, reward=%.2f)",
         thread_id,

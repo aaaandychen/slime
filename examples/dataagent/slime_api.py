@@ -8,8 +8,12 @@ are appended directly to that sample.
 Public API::
 
     slime_api.ensure_server(args)     # start aiohttp (idempotent)
-    slime_api._thread_samples[tid] = sample   # custom_generate writes directly
     slime_api.notify_resume()         # update_weights calls after continue_generation
+
+Sample mapping lives in the AsyncRolloutWorker's ``sample_map`` dict
+(``fully_async_rollout._global_worker.sample_map``).  custom_generate
+writes entries keyed by ``f"slime-{sample.index}"``; the handler reads
+them via ``X-DataAgent-Thread-Id``.
 """
 
 from __future__ import annotations
@@ -31,11 +35,11 @@ from slime.utils.http_utils import post
 logger = logging.getLogger(__name__)
 
 # ── shared state ──────────────────────────────────────────────────────
-_current_sample: Any = None  # set by custom_generate before SSE, cleared after
 _args: Any = None
 _server_started = False
 _server_lock = threading.Lock()
 _resume_generation: int = 0           # monotonic counter, notify_resume increments
+_sample_map: dict[str, Any] = {}      # threadId → Sample — bridged to worker by custom_generate
 
 
 # ── public API ────────────────────────────────────────────────────────
@@ -74,9 +78,10 @@ def notify_resume() -> None:
 
 async def handle_chat_completions(request: web.Request) -> web.Response:
     """POST /v1/chat/completions — OpenAI-compatible."""
-    sample = _current_sample
+    thread_id = request.headers.get("X-DataAgent-Thread-Id", "")
+    sample = _sample_map.get(thread_id)
     if sample is None:
-        return _error(503, "No active sample — custom_generate has not started an SSE stream yet")
+        return _error(400, f"Unknown threadId: {thread_id!r}")
 
     try:
         body = await request.json()
