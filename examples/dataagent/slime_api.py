@@ -106,10 +106,14 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     )
     input_ids = state.tokenizer.encode(prompt_text, add_special_tokens=False)
 
-    # Write prompt tokens into sample.tokens as context for the
-    # trainer's forward pass.  Do NOT touch loss_mask, rollout_log_probs,
-    # or response_length — those only cover model-generated tokens.
-    sample.tokens = (sample.tokens or []) + list(input_ids)
+    # First-turn prompt: write directly (like retool's initial prompt).
+    # Subsequent prompts: append_response_tokens(trainable=False) so
+    # loss_mask captures the interleaved 0/1 structure.  This keeps
+    # prompt_length = len(first_prompt) > 0 for data.py padding.
+    if sample.response_length == 0:
+        sample.tokens = (sample.tokens or []) + list(input_ids)
+    else:
+        sample.append_response_tokens(_args, tokens=list(input_ids), trainable=False)
 
     url = f"http://{_args.sglang_router_ip}:{_args.sglang_router_port}/generate"
     payload: dict[str, Any] = {
