@@ -42,12 +42,13 @@ def init_wandb_primary(args):
 
     # Prepare wandb init parameters
     # add random 6 length string with characters
+    base_group = args.wandb_group or args.wandb_exp_name or "slime"
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
+        group = base_group + "_" + wandb.util.generate_id()
         run_name = f"{group}-RANK_{args.rank}"
     else:
-        group = args.wandb_group
-        run_name = args.wandb_group
+        group = base_group
+        run_name = base_group
 
     # Prepare wandb init parameters
     init_kwargs = {

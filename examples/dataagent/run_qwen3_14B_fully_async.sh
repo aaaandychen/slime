@@ -36,6 +36,11 @@ DATAAGENT_PORT="${DATAAGENT_PORT:-8065}"
 EMBEDDING_PORT="${EMBEDDING_PORT:-8765}"
 API_PORT="${API_PORT:-18080}"
 
+# WandB
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+WANDB_PROJECT="${WANDB_PROJECT:-slime-dataagent}"
+WANDB_EXP_NAME="${WANDB_EXP_NAME:-qwen3-14B_$(date +%Y%m%d_%H%M%S)}"
+
 # ── helpers ────────────────────────────────────────────────────────────
 wait_for_url() {
     local url="$1" desc="$2" max="${3:-60}"
@@ -189,25 +194,24 @@ CKPT_ARGS=(
 ROLLOUT_ARGS=(
     --rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async
     --custom-generate-function-path examples.dataagent.custom_generate.generate
-    --update-weights-interval 2
-    --staleness-threshold 1
+    --update-weights-interval 1
 
     --prompt-data "${PROMPT_DATA}"
     --input-key query
     --rollout-shuffle
 
-    --num-rollout 10  # TODO: increase for production
-    --rollout-batch-size 4
-    --n-samples-per-prompt 2
+    --num-rollout 20  # TODO: increase for production
+    --rollout-batch-size 8
+    --n-samples-per-prompt 4
     --rollout-max-response-len 2048
     --rollout-temperature 1.0
 
-    --global-batch-size 16
+    --global-batch-size 8
     --balance-data
 )
 
 PERF_ARGS=(
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size 4
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
@@ -230,6 +234,9 @@ GRPO_ARGS=(
     --entropy-coef 0.00
     --eps-clip 0.2
     --eps-clip-high 0.28
+    --use-tis
+    --tis-clip 2.0
+    --tis-clip-low 0.0
 )
 
 OPTIMIZER_ARGS=(
@@ -242,7 +249,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 2
+    --rollout-num-gpus-per-engine 4
     --sglang-mem-fraction-static 0.7
     --sglang-server-concurrency 32
 )
@@ -254,7 +261,11 @@ MISC_ARGS=(
     --attention-softmax-in-fp32
     --attention-backend flash
     --transformer-impl transformer_engine
+    --cross-entropy-loss-fusion
     --log-passrate
+    --use-wandb
+    --wandb-project "${WANDB_PROJECT}"
+    --wandb-exp-name "${WANDB_EXP_NAME}"
 )
 
 # ── step 5: launch ────────────────────────────────────────────────────
@@ -272,21 +283,25 @@ ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --d
 RUNTIME_ENV_JSON=$(python3 -c "
 import json, os
 env = {
-    'PYTHONPATH': '/root/Megatron-LM/:${SCRIPT_DIR}:${SCRIPT_DIR}/../..',
+    'PYTHONPATH': '${MEGATRON_DIR:-/mnt/cephfs/chenzhenyang/Megatron-LM}:${SCRIPT_DIR}:${SCRIPT_DIR}/../..',
     'CUDA_DEVICE_MAX_CONNECTIONS': '1',
+            'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
     'NCCL_NVLS_ENABLE': '${NVLINK_COUNT}',
     'DATAAGENT_AGENT_ID': '${DATAAGENT_AGENT_ID}',
     'DATAAGENT_BASE_URL': '${DATAAGENT_BASE_URL}',
     'DATAAGENT_TIMEOUT': '600',
     'SLIME_API_PORT': '${API_PORT}',
+    'WANDB_API_KEY': '${WANDB_API_KEY}',
+    'WANDB_PROJECT': '${WANDB_PROJECT}',
+    'WANDB_EXP_NAME': '${WANDB_EXP_NAME}',
 }
-print(json.dumps({'env_vars': env}))
+# Explicit working_dir so the Ray job resolves train_async.py regardless
+# of the current shell cwd.
+print(json.dumps({'env_vars': env, 'working_dir': '${SLIME_DIR}'}))
 ")
-
-cd "${SLIME_DIR}"  # restore cwd so train_async.py resolves correctly
 ray job submit --address="http://127.0.0.1:8265" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -u train_async.py \
+    -- ${SLIME_DIR}/.venv/bin/python3 -u train_async.py \
     --actor-num-nodes 1 \
     --actor-num-gpus-per-node "${ACTOR_GPUS}" \
     --rollout-num-gpus "${ROLLOUT_GPUS}" \
