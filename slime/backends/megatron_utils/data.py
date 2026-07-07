@@ -313,7 +313,7 @@ def log_rollout_data(
                         tensor = torch.cat(val).clone().detach()
                         sum_of_sample_mean = get_sum_of_sample_mean(
                             total_lengths,
-                            response_lengths,
+                            [len(m) for m in loss_masks],
                             loss_masks,
                             rollout_mask_sums,
                         )

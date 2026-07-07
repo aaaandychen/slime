@@ -84,7 +84,7 @@ def get_sum_of_sample_mean(
             return sum(
                 [
                     (x_i * loss_mask_i).sum()
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    for x_i, loss_mask_i in zip(x.split([len(m) for m in loss_masks], dim=0), loss_masks, strict=False)
                 ]
             )
 

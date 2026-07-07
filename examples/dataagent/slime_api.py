@@ -107,13 +107,15 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     input_ids = state.tokenizer.encode(prompt_text, add_special_tokens=False)
 
     # First-turn prompt: write directly (like retool's initial prompt).
-    # Subsequent prompts: append_response_tokens(trainable=False) so
-    # loss_mask captures the interleaved 0/1 structure.  This keeps
-    # prompt_length = len(first_prompt) > 0 for data.py padding.
+    # Subsequent turns: chat_template produces the full conversation (including
+    # history already in sample.tokens).  Only append the *new* suffix so
+    # tokens don't get duplicated across turns.
     if sample.response_length == 0:
         sample.tokens = (sample.tokens or []) + list(input_ids)
     else:
-        sample.append_response_tokens(_args, tokens=list(input_ids), trainable=False)
+        new_prompt_tokens = input_ids[len(sample.tokens):]
+        if new_prompt_tokens:
+            sample.append_response_tokens(_args, tokens=new_prompt_tokens, trainable=False)
 
     url = f"http://{_args.sglang_router_ip}:{_args.sglang_router_port}/generate"
     payload: dict[str, Any] = {
