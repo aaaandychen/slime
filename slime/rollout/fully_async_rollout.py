@@ -120,6 +120,7 @@ class AsyncRolloutWorker:
         self.staleness_threshold: int = getattr(args, "staleness_threshold", 1)
         self.max_required_samples: int = int((1 + self.staleness_threshold) * args.rollout_batch_size)
         self.staleness_samples: int = 0
+        self.sample_map: dict[str, Any] = {}  # threadId → Sample for concurrent DataAgent workers
 
     # -- public --------------------------------------------------------------
 
