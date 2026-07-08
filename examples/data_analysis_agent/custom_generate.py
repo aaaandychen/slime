@@ -1,15 +1,23 @@
-"""Custom generate function bridging Slime to DataAgent via SSE.
+"""Custom generate function bridging Slime to Data-Analysis-Agent (DAA) via HTTP SSE.
 
-Phase 2: fully-async with Slime LLM API interception.
-DataAgent calls Slime's /v1/chat/completions instead of DeepSeek;
-Slime proxies to SGLang and captures tokens/logprobs into Sample.
+DAA runs as a separate Flask/waitress process. Each Slime sample:
+  1. Creates a DAA session
+  2. Connects the demo_sales SQLite database
+  3. Sends the query via POST /api/session/<sid>/chat
+  4. Consumes SSE events to extract final text + tool audit events
+  5. Scores via reward_func
+
+The thread_id flows: custom_generate → DAA HTTP header → ContextVar →
+OpenAI client default_headers → /v1/chat/completions → slime_api →
+Sample token capture.
 
 Usage:
-  --custom-generate-function-path examples.dataagent.custom_generate.generate
+  --custom-generate-function-path examples.data_analysis_agent.custom_generate.generate
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -22,86 +30,138 @@ from slime.rollout.fully_async_rollout import _global_worker
 
 logger = logging.getLogger(__name__)
 
-# ── config ────────────────────────────────────────────────────────────
+# ── config ──────────────────────────────────────────────────────────
+DAA_BASE_URL = os.environ.get("DAA_BASE_URL", "http://localhost:5001")
+DAA_TIMEOUT = int(os.environ.get("DAA_TIMEOUT", "600"))
+DAA_PROVIDER = os.environ.get("DAA_PROVIDER", "slime-rl")
+DEMO_SALES_DB = os.environ.get(
+    "DEMO_SALES_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_sales.db"),
+)
 
-DATAAGENT_BASE_URL = os.environ.get("DATAAGENT_BASE_URL", "http://localhost:8065")
-DATAAGENT_AGENT_ID = int(os.environ.get("DATAAGENT_AGENT_ID", "20"))
-DATAAGENT_TIMEOUT = int(os.environ.get("DATAAGENT_TIMEOUT", "600"))
+# Tables available for analysis
+_DEMO_TABLES = [
+    "products", "orders", "customers", "campaigns",
+    "returns", "daily_traffic", "suppliers",
+]
 
 
-# ── SSE consumer ──────────────────────────────────────────────────────
+# ── DAA HTTP helpers ────────────────────────────────────────────────
 
-async def _query_dataagent(query: str, thread_id: str) -> dict[str, Any]:
-    """Send query to DataAgent, collect SSE events, return structured result.
+async def _create_session(client: httpx.AsyncClient) -> str:
+    """Create a new DAA session, return its sid."""
+    resp = await client.post(f"{DAA_BASE_URL}/api/session/new")
+    resp.raise_for_status()
+    return resp.json()["session_id"]
 
-    *thread_id* is set by slime so the LLM API can route requests back
-    to the correct sample via ``X-DataAgent-Thread-Id``.
+
+async def _configure_session(client: httpx.AsyncClient, sid: str) -> None:
+    """Set LLM provider and connect the demo_sales SQLite database."""
+    # Set model provider to slime-rl custom model pointing at slime_api
+    await client.post(
+        f"{DAA_BASE_URL}/api/session/{sid}/model",
+        json={"provider": DAA_PROVIDER},
+    )
+
+    # Connect SQLite as read-only to prevent RL agent from corrupting data
+    db_uri = f"sqlite:///{DEMO_SALES_DB}?mode=ro"
+    resp = await client.post(
+        f"{DAA_BASE_URL}/api/session/{sid}/connect",
+        json={"connection_string": db_uri, "name": "demo_sales"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    source_id = data.get("source_id") or data.get("id")
+
+    # Select all tables for analysis
+    if source_id:
+        await client.post(
+            f"{DAA_BASE_URL}/api/session/{sid}/sources/{source_id}/analysis-tables",
+            json={"tables": _DEMO_TABLES},
+        )
+
+
+async def _chat_stream(
+    client: httpx.AsyncClient, sid: str, query: str, thread_id: str,
+) -> dict[str, Any]:
+    """Send query to DAA, consume SSE stream, return parsed result.
+
+    Returns:
+        dict with keys:
+          - text: concatenated final answer
+          - tool_events: list of tool_audit events
+          - error: error message if failed (only present on failure)
     """
-    url = f"{DATAAGENT_BASE_URL}/api/stream/search"
-    params = {"agentId": int(os.environ.get("DATAAGENT_AGENT_ID", "20")), "query": query, "threadId": thread_id}
-    headers = {"Accept": "text/event-stream"}
+    url = f"{DAA_BASE_URL}/api/session/{sid}/chat"
+    headers = {
+        "Content-Type": "application/json",
+        "X-DataAgent-Thread-Id": thread_id,
+        "Accept": "text/event-stream",
+    }
 
-    nodes: dict[str, dict[str, Any]] = {}  # "nodeName|textType" → {node, type, text}
-    node_order: list[str] = []
+    text_parts: list[str] = []
+    tool_events: list[dict] = []
     error_msg: str | None = None
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(DATAAGENT_TIMEOUT)) as client:
-        async with client.stream("GET", url, params=params, headers=headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                payload_str = line[5:].strip()
-                if not payload_str or payload_str == "[DONE]":
-                    continue
-                try:
-                    d = json.loads(payload_str)
-                except json.JSONDecodeError:
-                    continue
+    async with client.stream(
+        "POST", url, json={"message": query}, headers=headers,
+    ) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload_str = line[6:].strip()
+            if not payload_str:
+                continue
+            try:
+                event = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
 
-                if d.get("error"):
-                    error_msg = d.get("text", "unknown")
-                    break
-                if d.get("complete"):
-                    break
+            etype = event.get("type", "")
 
-                node_name = d.get("nodeName", "unknown")
-                text_type = d.get("textType", "TEXT")
-                text_chunk = d.get("text", "")
-                key = f"{node_name}|{text_type}"
-
-                if key not in nodes:
-                    nodes[key] = {"node": node_name, "type": text_type, "text": ""}
-                    node_order.append(key)
-                nodes[key]["text"] += text_chunk
+            if etype == "error":
+                error_msg = event.get("message", "DAA chat error")
+                break
+            if etype == "done":
+                break
+            if etype == "text_delta":
+                text_parts.append(str(event.get("content", "")))
+            elif etype == "tool_audit":
+                tool_events.append({
+                    "tool": event.get("tool", ""),
+                    "ok": event.get("ok", True),
+                    "error": event.get("error", ""),
+                    "summary": str(event.get("summary", ""))[:500],
+                    "content_len": len(str(event.get("content", ""))),
+                })
 
     if error_msg:
-        raise RuntimeError(f"DataAgent query failed: {error_msg}")
+        return {"error": error_msg}
 
-    return {"nodes": [nodes[k] for k in node_order]}
+    return {"text": "".join(text_parts), "tool_events": tool_events}
 
 
-# ── slime entrypoint ───────────────────────────────────────────────────
+# ── slime entrypoint ─────────────────────────────────────────────────
 
 async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
-    """Slime custom generate entrypoint.
+    """Slime custom generate entrypoint — Data-Analysis-Agent integration.
 
     Called by :func:`generate_and_rm` for each sample.  Starts the Slime
     LLM API server (idempotent), registers the sample under a unique
-    threadId, streams the query to DataAgent, waits for completion,
-    scores the result, and cleans up.
+    threadId, sends the query to DAA, waits for completion, scores the
+    result, and cleans up.
     """
     from slime.utils.types import Sample
 
     # Ensure the Slime LLM API is running (idempotent, first call starts it).
     slime_api.ensure_server(args)
 
-    # Bridge to the worker's shared dict the first time we run.
-    # After this, handler lookups and our writes use the same dict.
+    # Bridge to the worker's shared dict.
     if _global_worker is not None:
         slime_api._sample_map = _global_worker.sample_map
 
-    # ThreadId uses slime's built-in monotonically-increasing sample.index.
+    # Register sample under slime-{sample.index}
     thread_id = f"slime-{sample.index}"
     slime_api._sample_map[thread_id] = sample
 
@@ -109,30 +169,52 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
         sample.tokens = []
 
     query = str(sample.prompt).strip()
-    logger.info("DataAgent generate: threadId=%s query=%r", thread_id, query[:120])
+    logger.info("DAA generate: threadId=%s query=%r", thread_id, query[:120])
 
     try:
-        result = await _query_dataagent(query, thread_id)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(DAA_TIMEOUT)) as client:
+            sid = await _create_session(client)
+            logger.debug("DAA session created: sid=%s threadId=%s", sid, thread_id)
+
+            try:
+                await _configure_session(client, sid)
+                result = await _chat_stream(client, sid, query, thread_id)
+            finally:
+                try:
+                    await client.post(f"{DAA_BASE_URL}/api/session/{sid}/stop")
+                except Exception:
+                    pass
+
+        if "error" in result:
+            raise RuntimeError(result["error"])
+
     except Exception:
-        logger.exception("DataAgent generate failed: threadId=%s", thread_id)
+        logger.exception("DAA generate failed: threadId=%s", thread_id)
         sample.status = Sample.Status.FAILED
         sample.reward = 0.0
         slime_api._sample_map.pop(thread_id, None)
         return sample
 
-    from examples.dataagent.reward_func import score
+    # ── Score ─────────────────────────────────────────────────────────
+    from examples.data_analysis_agent.reward_func import score
 
-    sample.reward = score(result["nodes"], getattr(sample, "label", ""))
+    sample.reward = score(
+        text=result["text"],
+        tool_events=result["tool_events"],
+        label=getattr(sample, "label", ""),
+    )
     sample.metadata = getattr(sample, "metadata", None) or {}
-    sample.metadata["dataagent_nodes"] = result["nodes"]
-    sample.metadata["dataagent_thread_id"] = thread_id
+    sample.metadata["daa_text"] = result["text"]
+    sample.metadata["daa_tool_events"] = result["tool_events"]
+    sample.metadata["daa_thread_id"] = thread_id
     sample.status = Sample.Status.COMPLETED
 
     slime_api._sample_map.pop(thread_id, None)
     logger.info(
-        "DataAgent generate: done (threadId=%s, nodes=%d, reward=%.2f)",
+        "DAA generate: done (threadId=%s, text_len=%d, tools=%d, reward=%.2f)",
         thread_id,
-        len(result["nodes"]),
+        len(result["text"]),
+        len(result["tool_events"]),
         sample.reward,
     )
     return sample

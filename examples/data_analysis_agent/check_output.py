@@ -1,8 +1,8 @@
-"""Check script: call custom_generate directly and inspect the output sample.
+"""Check script: call DAA custom_generate directly and inspect the output sample.
 
 Usage:
   cd /path/to/slime
-  DATAAGENT_BASE_URL=http://localhost:8065 python examples/dataagent/check_output.py "各区域销售额排名"
+  DAA_BASE_URL=http://localhost:5001 python examples/data_analysis_agent/check_output.py "各区域销售额排名"
 """
 
 import asyncio
@@ -14,44 +14,40 @@ sys.path.insert(0, ".")
 
 from unittest.mock import MagicMock
 
-from examples.dataagent.custom_generate import generate
+from examples.data_analysis_agent.custom_generate import generate
 from slime.utils.types import Sample
 
 
 async def main(query: str):
-    # Build minimal fake args — the custom_generate function doesn't use
-    # most of these for Phase 1, but generate_and_rm expects them to exist.
     args = MagicMock()
     args.partial_rollout = False
     args.custom_generate_function_path = None
     args.group_rm = False
 
-    # Build the sample.
     sample = Sample()
     sample.prompt = query
     sample.index = 0
     sample.status = Sample.Status.PENDING
 
-    # Call the generate function.
     result = await generate(args, sample, sampling_params={})
 
     # ── Print results ────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"Status   : {result.status}")
     print(f"Reward   : {result.reward}")
-    print(f"Response len: {len(result.response or '')}")
-    print(f"Thread ID: {result.metadata.get('dataagent_thread_id', 'N/A')}")
-    print(f"\nNodes ({len(result.metadata.get('dataagent_nodes', []))}):")
-    for n in result.metadata.get("dataagent_nodes", []):
-        text_preview = n["text"][:200].replace("\n", "\\n")
-        print(f"  [{n['type']:12s}] {n['node']:35s} | {text_preview}...")
+    print(f"Thread ID: {result.metadata.get('daa_thread_id', 'N/A')}")
+    print(f"Text len : {len(result.metadata.get('daa_text', ''))}")
+    print(f"Tool events: {len(result.metadata.get('daa_tool_events', []))}")
+    for e in result.metadata.get("daa_tool_events", []):
+        status = "OK" if e.get("ok") else "FAIL"
+        print(f"  [{status}] {e['tool']}: {e.get('summary', '')[:100]}")
     print(f"\n{'='*60}")
-    print("Response (first 500 chars):")
-    print((result.response or "")[:500])
+    print("Text (first 800 chars):")
+    print((result.metadata.get("daa_text", ""))[:800])
     print(f"{'='*60}")
 
     if result.status == Sample.Status.FAILED:
-        print(f"\nERROR: {result.metadata.get('dataagent_error', 'unknown')}")
+        print(f"\nERROR: generation failed")
         return 1
     return 0
 
