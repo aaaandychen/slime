@@ -146,8 +146,23 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> list:
     except Exception:
         logger.exception("DataAgent generate failed: threadId=%s", thread_id)
         await adapter.drop_session(thread_id)
-        sample.status = Sample.Status.FAILED
+        # Match coding_agent_rl._abort_result: ensure all tensor fields are
+        # valid (non-None) lists so _tensorize_rollout_data_for_training
+        # doesn't crash on torch.as_tensor(None).  remove_sample=True tells
+        # the framework to filter this sample out before training.
+        sample.tokens = [0, 0]
+        sample.response = ""
+        sample.response_length = 1
+        sample.loss_mask = [0]
+        sample.rollout_log_probs = [0.0]
         sample.reward = 0.0
+        sample.remove_sample = True
+        sample.status = Sample.Status.ABORTED
+        sample.metadata = {
+            **(sample.metadata or {}),
+            "dataagent_thread_id": thread_id,
+            "abort_reason": "dataagent_query_failed",
+        }
         return [sample]
 
     # Compute reward from the DataAgent node trace + ground-truth label.
@@ -168,14 +183,22 @@ async def generate(args: Any, sample: Any, sampling_params: dict) -> list:
 
     if not samples:
         # Edge case: DataAgent answered without any LLM calls (e.g. cached).
-        # No turns were recorded, so finish_session returns [].  Emit the
-        # base sample with the reward so the group still trains.
-        sample.reward = reward
+        # No turns were recorded, so finish_session returns [].  Mark the
+        # sample for removal (no training signal) but keep tensor fields
+        # valid so _tensorize_rollout_data_for_training doesn't crash.
+        sample.tokens = [0, 0]
+        sample.response = ""
+        sample.response_length = 1
+        sample.loss_mask = [0]
+        sample.rollout_log_probs = [0.0]
+        sample.reward = float(reward)
+        sample.remove_sample = True
         sample.status = Sample.Status.COMPLETED
         sample.metadata = {
             **(sample.metadata or {}),
             "dataagent_nodes": nodes,
             "dataagent_thread_id": thread_id,
+            "abort_reason": "no_llm_calls",
         }
         return [sample]
 

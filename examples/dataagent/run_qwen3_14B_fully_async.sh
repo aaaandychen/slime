@@ -306,12 +306,6 @@ env = {
     # Bypass proxy for internal cluster traffic (SGLang weight sync, etc.)
     'no_proxy': '${no_proxy}',
     'NO_PROXY': '${no_proxy}',
-    # Raise fork threshold so DataAgent's multi-turn conversation merges
-    # into 1 sample per query instead of FORK'ing every turn (default 1024
-    # → responses > 1024 tokens fork → 8~12 turns → 27 segments → reward
-    # split 27 ways → 0.003 per segment → no gradient).  32768 lets
-    # DataAgent's typical 200~2000 token responses REALIGN (merge) instead.
-    'SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS': '32768',
     'WANDB_API_KEY': '${WANDB_API_KEY}',
     'WANDB_PROJECT': '${WANDB_PROJECT}',
     'WANDB_EXP_NAME': '${WANDB_EXP_NAME}',
