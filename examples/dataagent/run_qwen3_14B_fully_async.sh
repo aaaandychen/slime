@@ -281,6 +281,14 @@ ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l || echo 0)
 
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+# Bypass HTTP proxy for internal cluster traffic (SGLang engine, Ray, DataAgent).
+# Without this, requests.post() to 10.x.x.x:15000 goes through the corporate
+# proxy and times out during update_weights_from_distributed.
+NODE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${NODE_IP},10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+export NO_PROXY="${no_proxy}"
+echo "  no_proxy=${no_proxy}"
+
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" --disable-usage-stats
 
 RUNTIME_ENV_JSON=$(python3 -c "
@@ -295,6 +303,9 @@ env = {
     'DATAAGENT_TIMEOUT': '600',
     'DATAAGENT_ROLLOUT_GUARD_SEC': '${DATAAGENT_ROLLOUT_GUARD_SEC:-900}',
     'SLIME_API_PORT': '${API_PORT}',
+    # Bypass proxy for internal cluster traffic (SGLang weight sync, etc.)
+    'no_proxy': '${no_proxy}',
+    'NO_PROXY': '${no_proxy}',
     # Raise fork threshold so DataAgent's multi-turn conversation merges
     # into 1 sample per query instead of FORK'ing every turn (default 1024
     # → responses > 1024 tokens fork → 8~12 turns → 27 segments → reward
