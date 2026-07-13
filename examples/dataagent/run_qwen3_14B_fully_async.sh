@@ -259,7 +259,13 @@ MISC_ARGS=(
     --attention-backend flash
     --transformer-impl transformer_engine
     --cross-entropy-loss-fusion
-    --log-passrate
+    # NOTE: --log-passrate removed — compute_pass_rate asserts
+    # len(flat_rewards) == num_groups * group_size, but DataAgent's
+    # TrajectoryManager fans out into variable segments per query
+    # (5~27), so total rewards (412) != expected (8*4=32).  The
+    # pass@k metric also checks reward==1.0 which never holds after
+    # reward/K split across fan-out segments.  coding_agent_rl doesn't
+    # use this flag either.
     --use-wandb
     --wandb-project "${WANDB_PROJECT}"
     --wandb-exp-name "${WANDB_EXP_NAME}"

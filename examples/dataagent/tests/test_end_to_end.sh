@@ -1,10 +1,14 @@
 
 #!/bin/bash
-# End-to-end test: DataAgent + DeepSeek + Slime custom_generate.
+# End-to-end test: DataAgent with DeepSeek (no slime/SGLang).
+#
+# Verifies DataAgent itself works: MariaDB → Embedding → backend →
+# register DeepSeek model → datasource → agent → direct SSE query.
+# The final step curls DataAgent's /api/stream/search directly.
 #
 # Usage:
 #   export DEEPSEEK_API_KEY=sk-xxxxxxxx
-#   bash examples/dataagent/test_end_to_end.sh
+#   bash examples/dataagent/tests/test_end_to_end.sh
 #
 # Optional env vars:
 #   DATAAGENT_DIR    — DataAgent project root (default /mnt/cephfs/chenzhenyang/DataAgent)
@@ -78,20 +82,22 @@ fi
 wait_for_url "http://localhost:${EMBEDDING_PORT}/health" "Embedding service"
 
 # ── step 3: DataAgent backend ────────────────────────────────────────
-echo "=== [3/7] Starting DataAgent backend (:${DATAAGENT_PORT}) ==="
+echo "=== [3/7] Restarting DataAgent backend (:${DATAAGENT_PORT}) ==="
 
 export PATH="${DATAAGENT_DIR}/.venv/bin:$PATH"
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 
 JAR="${DATAAGENT_DIR}/data-agent-management/target/spring-ai-alibaba-data-agent-management-1.0.0-SNAPSHOT.jar"
 
-if ! curl -sf "http://localhost:${DATAAGENT_PORT}/echo/ok" &>/dev/null; then
-    pkill -f "spring-ai-alibaba-data-agent-management" 2>/dev/null || true
-    sleep 2
-    nohup java -jar "${JAR}" --spring.profiles.active=h2 \
-        --server.port="${DATAAGENT_PORT}" \
-        > /tmp/dataagent_backend.log 2>&1 &
-fi
+# Always restart: H2 in-memory DB holds stale model config from previous runs
+# (e.g. a slime training run that registered a CHAT model → :18080).  A clean
+# restart wipes everything so the DeepSeek model we register below is the
+# only one the agent can use.
+pkill -f "spring-ai-alibaba-data-agent-management" 2>/dev/null || true
+sleep 2
+nohup java -jar "${JAR}" --spring.profiles.active=h2 \
+    --server.port="${DATAAGENT_PORT}" \
+    > /tmp/dataagent_backend.log 2>&1 &
 wait_for_url "http://localhost:${DATAAGENT_PORT}/echo/ok" "DataAgent backend"
 
 # ── step 4: Register DeepSeek model ──────────────────────────────────
@@ -194,13 +200,52 @@ INIT=$(curl -s -X POST "${API_BASE}/api/agent/${AID}/datasources/init" | python3
 curl -s -X POST "${API_BASE}/api/agent/${AID}/publish" > /dev/null
 echo "  Agent id=${AID} ready"
 
-# ── step 7: Slime → DataAgent test ───────────────────────────────────
-echo "=== [7/7] Running Slime → DataAgent test ==="
+# ── step 7: Direct SSE query to DataAgent (DeepSeek backend) ─────────
+# This test verifies DataAgent itself works with DeepSeek — no slime/SGLang.
+# A direct SSE curl to DataAgent's /api/stream/search endpoint exercises
+# the full DataAgent pipeline (intent → SQL → report) via DeepSeek.
+echo "=== [7/7] Running direct SSE query to DataAgent ==="
 export DATAAGENT_BASE_URL="http://localhost:${DATAAGENT_PORT}"
 export DATAAGENT_AGENT_ID="${AID}"
 
-cd "${SLIME_DIR}"
-python examples/dataagent/check_output.py "${QUERY}"
+SSE_URL="${DATAAGENT_BASE_URL}/api/stream/search?agentId=${AID}&query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${QUERY}'))")"
+echo "  Querying: ${QUERY}"
+echo "  SSE URL:  ${SSE_URL}"
+echo "  (streaming response — first 200 chars of each node)"
+echo ""
+
+# Stream the SSE response and print each node's text preview.
+curl -sN --max-time 120 "${SSE_URL}" | python3 -c "
+import sys, json
+final_text = ''
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('data:'):
+        continue
+    payload = line[5:].strip()
+    if not payload or payload == '[DONE]':
+        continue
+    try:
+        d = json.loads(payload)
+    except json.JSONDecodeError:
+        continue
+    if d.get('error'):
+        print(f'  ERROR: {d.get(\"text\", \"unknown\")}')
+        sys.exit(1)
+    if d.get('complete'):
+        break
+    node = d.get('nodeName', '?')
+    ttype = d.get('textType', 'TEXT')
+    text = d.get('text', '')
+    if ttype == 'TEXT' and len(text) > 20:
+        final_text += text
+        print(f'  [{ttype:12s}] {node:30s} | {text[:80]}...')
+    elif ttype == 'RESULT_SET':
+        print(f'  [{ttype:12s}] {node:30s} | {text[:80]}')
+print()
+print('--- Final report (first 300 chars) ---')
+print(final_text[:300])
+"
 
 echo
 echo "=== All 7 steps completed successfully ==="

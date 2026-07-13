@@ -188,20 +188,54 @@ def _load_mysql() -> Any:
                           password="", database="demo_sales", charset="utf8mb4")
 
 
+def _is_mysql(con) -> bool:
+    """Detect whether *con* is a MySQL/MariaDB connection (vs sqlite)."""
+    return con.__class__.__module__.startswith("pymysql")
+
+
+def _month_expr(con, col: str) -> str:
+    """Dialect-aware month-truncation: ``'2026-01'`` from a DATE column.
+
+    SQLite has ``strftime``; MySQL/MariaDB has ``DATE_FORMAT``.  Both use
+    the same ``%Y-%m`` format string.
+    """
+    if _is_mysql(con):
+        return f"DATE_FORMAT({col}, '%Y-%m')"
+    return f"strftime('%Y-%m', {col})"
+
+
 # ── helpers ─────────────────────────────────────────────────────────────
 
 def _q(con, sql: str) -> list[dict]:
+    """Execute *sql*, return rows as dicts with ``Decimal`` coerced to ``float``.
+
+    MySQL/MariaDB ``SUM()`` and ``DECIMAL`` columns come back as
+    ``decimal.Decimal``; ``Decimal / float`` raises ``TypeError``, which
+    breaks f-string arithmetic in the summary lines.  Normalise at the
+    source so every template gets plain Python floats.
+    """
+    from decimal import Decimal
     cur = con.cursor()
     cur.execute(sql)
     cols = [d[0] for d in cur.description] if cur.description else []
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    rows = []
+    for row in cur.fetchall():
+        rows.append({
+            c: (float(v) if isinstance(v, Decimal) else v)
+            for c, v in zip(cols, row)
+        })
+    return rows
 
 
 def _scalar(con, sql: str) -> Any:
     cur = con.cursor()
     cur.execute(sql)
     row = cur.fetchone()
-    return row[0] if row else None
+    if not row:
+        return None
+    from decimal import Decimal
+    v = row[0]
+    return float(v) if isinstance(v, Decimal) else v
 
 
 def _num(x: Any) -> float:
@@ -254,8 +288,9 @@ def _t_channel_sales(con) -> list[tuple[str, dict]]:
 
 
 def _t_monthly_sales_trend(con) -> list[tuple[str, dict]]:
-    rows = _q(con, """
-        SELECT strftime('%Y-%m', order_date) AS ym,
+    ym_expr = _month_expr(con, "order_date")
+    rows = _q(con, f"""
+        SELECT {ym_expr} AS ym,
                SUM(quantity * unit_price) AS sales,
                COUNT(*) AS orders
         FROM orders GROUP BY ym ORDER BY ym
@@ -263,7 +298,7 @@ def _t_monthly_sales_trend(con) -> list[tuple[str, dict]]:
     label = {
         "key_numbers": [str(_round(r["sales"], 2)) for r in rows],
         "key_entities": [r["ym"] for r in rows],
-        "expected_sql": "SELECT strftime('%Y-%m', order_date), SUM(quantity*unit_price) FROM orders GROUP BY 1",
+        "expected_sql": f"SELECT {ym_expr}, SUM(quantity*unit_price) FROM orders GROUP BY 1",
         "summary": "、".join(f"{r['ym']}({r['sales']:.0f})" for r in rows),
     }
     return [("每月的总销售额和订单量趋势", label)]
