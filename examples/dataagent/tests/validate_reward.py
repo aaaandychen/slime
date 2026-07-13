@@ -13,8 +13,8 @@ vary with answer quality, RL won't move it.
 
 Usage::
 
-    python examples/dataagent/validate_reward.py
-    python examples/dataagent/validate_reward.py --jsonl examples/dataagent/queries_labeled.jsonl
+    python examples/dataagent/tests/validate_reward.py
+    python examples/dataagent/tests/validate_reward.py --jsonl examples/dataagent/queries_labeled.jsonl
 """
 
 from __future__ import annotations
@@ -24,11 +24,13 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from examples.dataagent.reward_func import score, extract_numbers, _numbers_match  # noqa: E402
 
+# queries_labeled.jsonl lives in the parent directory (examples/dataagent/).
 HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(HERE, "..")
 
 
 def _make_nodes(final_text: str, sql_text: str = "product_id|name\n1|iPhone") -> list[dict]:
@@ -102,7 +104,7 @@ def _no_sql_traces(label: dict) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--jsonl", default=os.path.join(HERE, "queries_labeled.jsonl"))
+    ap.add_argument("--jsonl", default=os.path.join(DATA_DIR, "queries_labeled.jsonl"))
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 

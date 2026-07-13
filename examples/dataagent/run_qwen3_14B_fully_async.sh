@@ -198,6 +198,7 @@ ROLLOUT_ARGS=(
     --num-rollout 20  # TODO: increase for production
     --rollout-batch-size 8
     --n-samples-per-prompt 4
+    --rollout-max-context-len 32768
     --rollout-max-response-len 2048
     --rollout-temperature 1.0
 
@@ -247,6 +248,7 @@ SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 4
     --sglang-mem-fraction-static 0.7
     --sglang-server-concurrency 32
+    --sglang-reasoning-parser qwen3
 )
 
 MISC_ARGS=(
@@ -285,6 +287,7 @@ env = {
     'DATAAGENT_AGENT_ID': '${DATAAGENT_AGENT_ID}',
     'DATAAGENT_BASE_URL': '${DATAAGENT_BASE_URL}',
     'DATAAGENT_TIMEOUT': '600',
+    'DATAAGENT_ROLLOUT_GUARD_SEC': '${DATAAGENT_ROLLOUT_GUARD_SEC:-900}',
     'SLIME_API_PORT': '${API_PORT}',
     'WANDB_API_KEY': '${WANDB_API_KEY}',
     'WANDB_PROJECT': '${WANDB_PROJECT}',

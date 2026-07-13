@@ -16,7 +16,7 @@ set -e
 # ── config ────────────────────────────────────────────────────────────
 DATAAGENT_DIR="${DATAAGENT_DIR:-/mnt/cephfs/chenzhenyang/DataAgent}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 QUERY="${QUERY:-各区域销售额排名}"
 DATAAGENT_PORT=8065
 EMBEDDING_PORT=8765

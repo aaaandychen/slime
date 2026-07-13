@@ -1,8 +1,19 @@
 """Custom generate function bridging Slime to DataAgent via SSE.
 
-Phase 2: fully-async with Slime LLM API interception.
-DataAgent calls Slime's /v1/chat/completions instead of DeepSeek;
-Slime proxies to SGLang and captures tokens/logprobs into Sample.
+Phase 3: fully leverages slime's OpenAIAdapter for LLM interception.
+DataAgent calls the adapter's /v1/chat/completions instead of a hand-rolled
+proxy; the adapter's TrajectoryManager records every turn with correct
+loss_mask and linearises the session into list[Sample] on finish_session.
+
+Architecture (aligned with coding_agent_rl):
+
+    generate(args, sample, sampling_params)
+      ├── AdapterService(args)          ← singleton: tokenizer + adapter + aiohttp
+      ├── adapter.open_session(tid)     ← register session before DataAgent runs
+      ├── _query_dataagent(query, tid)  ← SSE → DataAgent → adapter (auto)
+      ├── score(nodes, label)           ← compute reward from node trace
+      └── adapter.finish_session(tid, reward=…) → list[Sample]
+            (DataAgent linear conversation → 1 Sample; branches → N)
 
 Usage:
   --custom-generate-function-path examples.dataagent.custom_generate.generate
@@ -10,23 +21,26 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
 
-from examples.dataagent import slime_api
-from slime.rollout.fully_async_rollout import _global_worker
+from examples.dataagent.adapter import AdapterService
+from examples.dataagent.reward_func import score
 
 logger = logging.getLogger(__name__)
 
 # ── config ────────────────────────────────────────────────────────────
 
 DATAAGENT_BASE_URL = os.environ.get("DATAAGENT_BASE_URL", "http://localhost:8065")
-DATAAGENT_AGENT_ID = int(os.environ.get("DATAAGENT_AGENT_ID", "20"))
 DATAAGENT_TIMEOUT = int(os.environ.get("DATAAGENT_TIMEOUT", "600"))
+# Wall-clock guard for the whole rollout (boot + SSE + reward).
+ROLLOUT_GUARD_SEC = int(os.environ.get("DATAAGENT_ROLLOUT_GUARD_SEC", "0") or 0)
 
 
 # ── SSE consumer ──────────────────────────────────────────────────────
@@ -34,14 +48,20 @@ DATAAGENT_TIMEOUT = int(os.environ.get("DATAAGENT_TIMEOUT", "600"))
 async def _query_dataagent(query: str, thread_id: str) -> dict[str, Any]:
     """Send query to DataAgent, collect SSE events, return structured result.
 
-    *thread_id* is set by slime so the LLM API can route requests back
-    to the correct sample via ``X-DataAgent-Thread-Id``.
+    DataAgent internally makes LLM calls to the adapter's
+    ``/v1/chat/completions``.  Each call carries ``X-DataAgent-Thread-Id``
+    → adapter routes to the correct session and the TrajectoryManager
+    records the turn.
     """
     url = f"{DATAAGENT_BASE_URL}/api/stream/search"
-    params = {"agentId": int(os.environ.get("DATAAGENT_AGENT_ID", "20")), "query": query, "threadId": thread_id}
+    params = {
+        "agentId": int(os.environ.get("DATAAGENT_AGENT_ID", "20")),
+        "query": query,
+        "threadId": thread_id,
+    }
     headers = {"Accept": "text/event-stream"}
 
-    nodes: dict[str, dict[str, Any]] = {}  # "nodeName|textType" → {node, type, text}
+    nodes: dict[str, dict[str, Any]] = {}
     node_order: list[str] = []
     error_msg: str | None = None
 
@@ -83,56 +103,88 @@ async def _query_dataagent(query: str, thread_id: str) -> dict[str, Any]:
 
 # ── slime entrypoint ───────────────────────────────────────────────────
 
-async def generate(args: Any, sample: Any, sampling_params: dict) -> Any:
+async def generate(args: Any, sample: Any, sampling_params: dict) -> list:
     """Slime custom generate entrypoint.
 
-    Called by :func:`generate_and_rm` for each sample.  Starts the Slime
-    LLM API server (idempotent), registers the sample under a unique
-    threadId, streams the query to DataAgent, waits for completion,
-    scores the result, and cleans up.
+    Uses the standard adapter session lifecycle:
+
+        open_session → [DataAgent calls adapter] → finish_session
+
+    Returns ``list[Sample]`` for slime's ``generate_and_rm`` contract
+    (which accepts both single ``Sample`` and ``list[Sample]``).
+    DataAgent's linear conversation produces exactly 1 Sample — all turns
+    concatenated with correct loss_mask by TrajectoryManager.  If the
+    conversation branches (compaction forks, sub-agents), the manager
+    automatically fans out into multiple Samples.
     """
     from slime.utils.types import Sample
 
-    # Ensure the Slime LLM API is running (idempotent, first call starts it).
-    slime_api.ensure_server(args)
+    # Start adapter (idempotent singleton — first call boots the HTTP server).
+    svc = AdapterService(args)
+    adapter = svc.adapter
 
-    # Bridge to the worker's shared dict the first time we run.
-    # After this, handler lookups and our writes use the same dict.
-    if _global_worker is not None:
-        slime_api._sample_map = _global_worker.sample_map
-
-    # ThreadId uses slime's built-in monotonically-increasing sample.index.
+    # Session ID: deterministic, maps to X-DataAgent-Thread-Id header.
     thread_id = f"slime-{sample.index}"
-    slime_api._sample_map[thread_id] = sample
-
-    if sample.tokens is None:
-        sample.tokens = []
+    adapter.open_session(
+        thread_id,
+        sampling_defaults=sampling_params,
+        max_context_tokens=svc.max_context_len,
+    )
 
     query = str(sample.prompt).strip()
     logger.info("DataAgent generate: threadId=%s query=%r", thread_id, query[:120])
+    t0 = time.time()
 
+    nodes: list[dict] = []
     try:
-        result = await _query_dataagent(query, thread_id)
+        if ROLLOUT_GUARD_SEC > 0:
+            async with asyncio.timeout(ROLLOUT_GUARD_SEC):
+                result = await _query_dataagent(query, thread_id)
+        else:
+            result = await _query_dataagent(query, thread_id)
+        nodes = result["nodes"]
     except Exception:
         logger.exception("DataAgent generate failed: threadId=%s", thread_id)
+        await adapter.drop_session(thread_id)
         sample.status = Sample.Status.FAILED
         sample.reward = 0.0
-        slime_api._sample_map.pop(thread_id, None)
-        return sample
+        return [sample]
 
-    from examples.dataagent.reward_func import score
+    # Compute reward from the DataAgent node trace + ground-truth label.
+    reward = score(nodes, getattr(sample, "label", "") or "")
 
-    sample.reward = score(result["nodes"], getattr(sample, "label", ""))
-    sample.metadata = getattr(sample, "metadata", None) or {}
-    sample.metadata["dataagent_nodes"] = result["nodes"]
-    sample.metadata["dataagent_thread_id"] = thread_id
-    sample.status = Sample.Status.COMPLETED
-
-    slime_api._sample_map.pop(thread_id, None)
-    logger.info(
-        "DataAgent generate: done (threadId=%s, nodes=%d, reward=%.2f)",
+    # finish_session drains the session's trajectory tree into list[Sample]
+    # with correct tokens/loss_mask/log_probs.  The reward is set on each
+    # emitted sample (linear → 1 sample gets full reward; branches → split).
+    samples = await adapter.finish_session(
         thread_id,
-        len(result["nodes"]),
-        sample.reward,
+        base_sample=sample,
+        reward=float(reward),
+        extra_metadata={
+            "dataagent_nodes": nodes,
+            "dataagent_thread_id": thread_id,
+        },
     )
-    return sample
+
+    if not samples:
+        # Edge case: DataAgent answered without any LLM calls (e.g. cached).
+        # No turns were recorded, so finish_session returns [].  Emit the
+        # base sample with the reward so the group still trains.
+        sample.reward = reward
+        sample.status = Sample.Status.COMPLETED
+        sample.metadata = {
+            **(sample.metadata or {}),
+            "dataagent_nodes": nodes,
+            "dataagent_thread_id": thread_id,
+        }
+        return [sample]
+
+    logger.info(
+        "DataAgent generate: done (threadId=%s, nodes=%d, reward=%.2f, segments=%d, elapsed=%.1fs)",
+        thread_id,
+        len(nodes),
+        reward,
+        len(samples),
+        time.time() - t0,
+    )
+    return samples
