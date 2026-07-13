@@ -29,7 +29,7 @@ source "${SCRIPT_DIR}/../../scripts/models/qwen3-14B.sh"
 # ── config ────────────────────────────────────────────────────────────
 MODEL_DIR="${MODEL_DIR:-/mnt/cephfs/chenzhenyang/models/Qwen3-14B}"
 DATAAGENT_DIR="${DATAAGENT_DIR:-/mnt/cephfs/chenzhenyang/DataAgent}"
-PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/queries.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/queries_labeled.jsonl}"
 SAVE_DIR="${SAVE_DIR:-/mnt/cephfs/chenzhenyang/models/Qwen3-14B_slime_dataagent}"
 
 DATAAGENT_PORT="${DATAAGENT_PORT:-8065}"
@@ -170,14 +170,8 @@ echo "  DATAAGENT_AGENT_ID=${DATAAGENT_AGENT_ID}"
 # ── step 3: prompt data ───────────────────────────────────────────────
 echo "=== [3/5] Preparing prompt data ==="
 if [[ ! -f "${PROMPT_DATA}" ]]; then
-    echo "  Generating default queries.jsonl..."
-    cat > "${PROMPT_DATA}" << 'EOF'
-{"query": "各区域销售额排名"}
-{"query": "2026年上半年利润率最高的5个商品"}
-{"query": "各渠道转化率对比分析"}
-{"query": "华东区域月度销售额趋势"}
-{"query": "各品类销售额占比分析"}
-EOF
+    echo "  ${PROMPT_DATA} not found, generating labeled queries..."
+    python3 "${SCRIPT_DIR}/generate_training_data.py" --source offline --out "${PROMPT_DATA}"
 fi
 echo "  Prompt data: ${PROMPT_DATA} ($(wc -l < "${PROMPT_DATA}") queries)"
 
@@ -198,6 +192,7 @@ ROLLOUT_ARGS=(
 
     --prompt-data "${PROMPT_DATA}"
     --input-key query
+    --label-key label
     --rollout-shuffle
 
     --num-rollout 20  # TODO: increase for production

@@ -265,3 +265,92 @@ DataAgent 不同接口返回格式不统一：
 | `POST /api/agent/{id}/datasources/init` | `{"success": true/false, ...}` |
 
 处理时注意区分。
+
+## 训练数据 + 奖励机制（核心）
+
+要让 reward 真正上升，奖励必须满足两个条件：
+1. **可区分**：不同质量的回答要有不同的 reward（否则无梯度信号）
+2. **不可作弊**：不能只靠格式（标题、表格）刷分（否则模型会 reward hacking）
+
+### 设计：基于 ground-truth 的数值准确性奖励
+
+每个 query 都带结构化 label（JSON 字符串），包含从 `demo_sales` 数据库实际计算出的：
+- `key_numbers` — 正确报告中必须出现的关键数字
+- `key_entities` — 必须提及的实体（区域、商品名等）
+- `expected_sql` — 标准 SQL（审计用）
+- `summary` — 人类可读的预期答案
+
+奖励函数 `reward_func.score(nodes, label)` 在结构化模式下：
+
+| 维度 | 权重 | 说明 |
+|------|------|------|
+| 数值准确性 | 0.45 | 报告中是否引用了正确的 ground-truth 数字（主导信号）|
+| 实体覆盖 | 0.20 | 是否提及了关键实体 |
+| SQL 执行成功 | 0.15 | 至少有一条非空 RESULT_SET |
+| 格式 | 0.10 | 标题、表格、长度合理（次要，防退化）|
+| 过程 | 0.10 | 多步推理（≥3 个 substantial 节点）|
+| 全对加成 | +0.10 | 所有关键数字和实体都命中时额外奖励 |
+| 惩罚 | −0.10~0.20 | 平凡输出、SQL 全错+短文本 |
+
+数值匹配容忍度：整数计数近精确匹配（±0.5），浮点数（金额、比率）1% 相对误差
+（兼容 `25.28万` ↔ `252811` 的万/亿单位换算）。
+
+### 生成训练数据
+
+```bash
+# 默认 offline 模式：从 Database.md 解析 INSERT 数据，无需运行 MariaDB
+python examples/dataagent/generate_training_data.py --print-summary
+
+# 连接 MariaDB 重新计算（验证一致性）
+python examples/dataagent/generate_training_data.py --source mysql --out queries_labeled.jsonl
+```
+
+输出 `queries_labeled.jsonl`，每行：
+```json
+{"query": "各区域销售额排名",
+ "label": "{\"key_numbers\": [\"252811.0\", \"213744.0\", \"167635.0\"], \"key_entities\": [\"华东\", \"华北\", \"华南\"], ...}"}
+```
+
+当前内置 20 个 query 模板（区域排名、渠道对比、月度趋势、品类占比、Top-N 商品/客户、
+利润率、ROI、库存、供应商评分、退货分析等）。要扩展：在 `generate_training_data.py`
+的 `TEMPLATES` 列表中加一个返回 `(query, label_dict)` 的函数即可。
+
+### 验证奖励可区分性
+
+```bash
+python examples/dataagent/validate_reward.py -v
+```
+
+典型输出（20 个 query 的平均 reward）：
+
+```
+Query                                      good  partial  wrong    fmt  noSQL
+────────────────────────────────────────────────────────────────────────────
+各区域销售额排名                                   0.86     0.33   0.15   0.11   0.00
+...
+────────────────────────────────────────────────────────────────────────────
+AVERAGE                                    0.88     0.30   0.15   0.11   0.00
+
+Sanity checks:
+  good > wrong ?    0.88 > 0.15  → YES ✓   ← 主梯度方向
+  good > partial ?  0.88 > 0.30  → YES ✓
+  partial > wrong ? 0.30 > 0.15  → YES ✓   ← 部分正确有部分分
+  good > fmt-only ? 0.88 > 0.11  → YES ✓   ← 格式无法刷分
+  wrong ≈ fmt-only ? 0.15 vs 0.11  → YES ✓ ← 错答案 ≈ 没答案
+```
+
+五个 check 全过 → reward 信号有梯度、不可作弊 → RL 能让 reward 上升。
+
+### 训练命令
+
+`run_qwen3_14B_fully_async.sh` 已更新为使用 labeled 数据：
+
+```bash
+--prompt-data queries_labeled.jsonl
+--input-key query
+--label-key label          # ← 新增，把 label 字段加载到 sample.label
+```
+
+`custom_generate.generate()` 把 `sample.label` 透传给 `reward_func.score()`，
+后者解析 JSON 得到 ground-truth，计算数值准确性奖励。
+
