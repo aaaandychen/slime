@@ -28,7 +28,8 @@ reward → TrajectoryManager.get_trajectory() → Sample → PPO/GRPO training
 |------|-------|---------|
 | `convert_longds_to_slime.py` | 1 | Convert LongDS task.json → slime JSONL |
 | `longds_task.py` | 2 | Prompt building, answer evaluation, metadata validation |
-| `generate.py` | 3+ | Per-sample rollout orchestrator (reuses ClaudeCodeHarness + AnthropicAdapter) |
+| `longds_harness.py` | 3 | ClaudeCodeHarness with --resume for multi-turn |
+| `generate.py` | 3 | Per-sample rollout orchestrator |
 | `run_longds_8nodes.sh` | 5 | Ray training launch script |
 
 Sandbox images are **not** built here — reuse an existing Python data-analysis
@@ -59,6 +60,15 @@ python3 tests/test_phase1_convert.py
 Verify:
 ```bash
 python3 tests/test_phase2_longds_task.py
+```
+
+## Phase 3: Dry run (FakeSandbox, no Docker)
+
+Verifies the full orchestration: sandbox boot → per-turn `claude -p`
+→ answer.json parsing → reward computation.
+
+```bash
+python3 tests/test_phase3_dry_run.py
 ```
 
 ## Answer evaluation
