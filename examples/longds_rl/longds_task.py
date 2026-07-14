@@ -184,14 +184,15 @@ def _json_match(pred: str, gt: str) -> float:
 
 
 def _dict_equal(d1: Any, d2: Any) -> bool:
+    if isinstance(d1, dict) and isinstance(d2, dict):
+        return all(_dict_equal(d1.get(k), d2.get(k)) for k in d2)
+    if isinstance(d1, list) and isinstance(d2, list):
+        return len(d1) == len(d2) and all(_dict_equal(a, b) for a, b in zip(d1, d2))
+    # Numeric: allow int/float coercion (json parses 3.00→3.0, 3→3)
+    if isinstance(d1, (int, float)) and isinstance(d2, (int, float)):
+        return _numeric_match(str(d1), str(d2)) >= 1.0
     if type(d1) != type(d2):
         return False
-    if isinstance(d1, dict):
-        return all(_dict_equal(d1.get(k), d2.get(k)) for k in d2)
-    if isinstance(d1, list):
-        return len(d1) == len(d2) and all(_dict_equal(a, b) for a, b in zip(d1, d2))
-    if isinstance(d1, float):
-        return _numeric_match(str(d1), str(d2)) >= 1.0
     return str(d1).strip() == str(d2).strip()
 
 

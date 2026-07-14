@@ -43,8 +43,10 @@ pip install zjunlp/LongDS   # or: huggingface-cli download zjunlp/LongDS --repo-
 python3 convert_longds_to_slime.py \
     --task-root /path/to/dataset/task/longds \
     --data-root /path/to/dataset/data/longds \
-    --image registry.example.com/longds:latest \
     --output longds_train.jsonl
+
+# --image is optional — only needed when you're ready to train and know
+# which sandbox image to use
 ```
 
 Verify:

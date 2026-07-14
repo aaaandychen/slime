@@ -74,8 +74,6 @@ def convert_one_task(
     task_info: dict[str, str],
     task_root: Path,
     data_root: Path,
-    image: str,
-    workdir: str = "/workspace",
 ) -> dict[str, Any] | None:
     domain = task_info["task_domain"]
     dataset = task_info["dataset_name"]
@@ -116,8 +114,6 @@ def convert_one_task(
             "task_id": task_key,
             "domain": domain,
             "dataset": dataset,
-            "image": image,
-            "workdir": workdir,
             "data_root": str(data_dir.resolve()),
             "data_files": data_files,
             "turns": turns,
@@ -130,8 +126,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Convert LongDS tasks to slime JSONL")
     parser.add_argument("--task-root", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--image", default="longds-default:latest")
-    parser.add_argument("--workdir", default="/workspace")
     parser.add_argument("--output", "-o", type=Path, required=True)
     args = parser.parse_args()
 
@@ -143,8 +137,7 @@ def main() -> int:
     task_list = load_json(task_list_path)
     rows, skipped = [], 0
     for info in task_list:
-        row = convert_one_task(info, args.task_root, args.data_root,
-                               args.image, args.workdir)
+        row = convert_one_task(info, args.task_root, args.data_root)
         if row is None:
             skipped += 1
         else:

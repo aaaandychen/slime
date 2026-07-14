@@ -52,7 +52,6 @@ def test_convert_one_task():
     row = cvt.convert_one_task(
         {"task_domain": "sports", "dataset_name": "fifa_analytics", "task_id": "task1"},
         task_root=_FIXTURES, data_root=_FIXTURES,
-        image="test:latest", workdir="/workspace",
     )
     assert row is not None
     assert row["prompt"] == ""
@@ -61,8 +60,6 @@ def test_convert_one_task():
     md = row["metadata"]
     assert md["task_id"] == "sports/fifa_analytics/task1"
     assert md["domain"] == "sports"
-    assert md["image"] == "test:latest"
-    assert md["workdir"] == "/workspace"
     assert md["num_turns"] == 3
     assert "players.csv" in md["data_files"]
     assert "teams.csv" in md["data_files"]
@@ -83,7 +80,7 @@ def test_convert_one_task():
 def test_convert_missing_task():
     row = cvt.convert_one_task(
         {"task_domain": "sports", "dataset_name": "nonexistent", "task_id": "task99"},
-        task_root=_FIXTURES, data_root=_FIXTURES, image="t", workdir="/w",
+        task_root=_FIXTURES, data_root=_FIXTURES,
     )
     assert row is None
 
@@ -92,7 +89,7 @@ def test_full_pipeline():
     task_list = cvt.load_json(_FIXTURES / "task_list.json")
     rows = []
     for info in task_list:
-        r = cvt.convert_one_task(info, _FIXTURES, _FIXTURES, "test:latest", "/workspace")
+        r = cvt.convert_one_task(info, _FIXTURES, _FIXTURES)
         if r:
             rows.append(r)
     assert len(rows) == 1
@@ -108,7 +105,7 @@ def test_full_pipeline():
         assert loaded["label"] == "sports__fifa_analytics__task1"
         for k in ("prompt", "label", "metadata"):
             assert k in loaded
-        for k in ("turns", "data_files", "image", "workdir", "data_root", "domain"):
+        for k in ("turns", "data_files", "data_root", "domain"):
             assert k in loaded["metadata"]
     finally:
         tmp.unlink(missing_ok=True)
