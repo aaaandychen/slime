@@ -22,7 +22,7 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 # ============ model ============
 HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/cephfs/chenzhenyang/models/Qwen3-14B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/cephfs/chenzhenyang/models/Qwen3-14B_torch_dist}"
-PROMPT_DATA="${PROMPT_DATA:-/path/to/longds_train.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-/mnt/cephfs/chenzhenyang/datasets/LongDS/longds_train.jsonl}"
 
 # ============ model parallelism ============
 TP_SIZE="${TP_SIZE:-2}"
@@ -46,20 +46,16 @@ mkdir -p "${RUN_ROOT}/rollout_dumps"
 LOG_FILE="${RUN_ROOT}/run.log"
 echo "Log: ${LOG_FILE}"
 
-# ============ model architecture (Qwen3 dense) ============
-# --spec reads hidden_size/num_layers/heads from HF config.json.
-# Qwen3-14B is dense (no MoE), so MoE args from the SWE script are omitted.
+# Qwen3-14B: standard dense transformer. Megatron auto-detects
+# hidden_size/num_layers/heads from --hf-checkpoint config.json.
 MODEL_ARGS=(
-   --spec "slime_plugins.models.qwen3_5" "get_qwen3_5_spec"
    --disable-bias-linear
    --qk-layernorm
-   --group-query-attention
    --normalization RMSNorm
    --apply-layernorm-1p
    --position-embedding-type rope
    --swiglu
    --untie-embeddings-and-output-weights
-   --attention-output-gate
 )
 
 CKPT_ARGS=(
@@ -80,6 +76,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
+   --rollout-stop-token-ids 248046 248044
    --num-steps-per-rollout 1
    --global-batch-size 32
    --micro-batch-size 1
