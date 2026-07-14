@@ -28,11 +28,12 @@ reward → TrajectoryManager.get_trajectory() → Sample → PPO/GRPO training
 |------|-------|---------|
 | `convert_longds_to_slime.py` | 1 | Convert LongDS task.json → slime JSONL |
 | `longds_task.py` | 2 | Prompt building, answer evaluation, metadata validation |
-| `longds_harness.py` | 3 | ClaudeCodeHarness with --resume for multi-turn |
-| `generate.py` | 3 | Per-sample rollout orchestrator |
+| `generate.py` | 4 | Per-sample rollout: subprocess `claude -p` + AnthropicAdapter |
 | `run_longds_8nodes.sh` | 5 | Ray training launch script |
 
-Sandbox images are **not** built here — reuse an existing Python data-analysis
+No Docker / E2B / sandbox is needed — each rollout runs in a temporary
+directory. Claude Code calls the AnthropicAdapter via `ANTHROPIC_BASE_URL`
+env var; the adapter captures token logprobs via SGLang.
 image (DSGym's, or any image with pandas/scipy). ClaudeCodeHarness installs
 Node.js + Claude Code CLI at boot time from host tarballs.
 
@@ -62,13 +63,11 @@ Verify:
 python3 tests/test_phase2_longds_task.py
 ```
 
-## Phase 3: Dry run (FakeSandbox, no Docker)
+## Phase 4: Full pipeline (subprocess + Adapter)
 
-Verifies the full orchestration: sandbox boot → per-turn `claude -p`
-→ answer.json parsing → reward computation.
-
+Verify:
 ```bash
-python3 tests/test_phase3_dry_run.py
+python3 tests/test_phase4_adapter.py
 ```
 
 ## Answer evaluation
