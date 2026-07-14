@@ -1,0 +1,23 @@
+[
+  {
+    "turn_id": 1,
+    "context": "You are analyzing FIFA player statistics from the 2022 World Cup. The dataset `data/players.csv` contains columns: name, team, goals, assists, matches_played, minutes_played.",
+    "question": "Which player scored the most goals in the tournament?",
+    "answer": "Kylian Mbappe",
+    "files_used": ["players.csv"]
+  },
+  {
+    "turn_id": 2,
+    "context": "Using the same dataset. You previously found Kylian Mbappe scored the most goals (8). Now consider the relationship between goals and assists.",
+    "question": "What is the Pearson correlation coefficient between goals and assists among players who played at least 90 minutes? Round to 4 decimal places.",
+    "answer": "0.4521",
+    "files_used": ["players.csv"]
+  },
+  {
+    "turn_id": 3,
+    "context": "Now consider team-level statistics. The teams dataset is at `data/teams.csv` with columns: team, group, wins, draws, losses, matches_played. You need to first compute goals_scored per team from players.csv, then find the best ratio.",
+    "question": "Which team had the highest ratio of total goals_scored to matches_played?",
+    "answer": "France",
+    "files_used": ["players.csv", "teams.csv"]
+  }
+]
