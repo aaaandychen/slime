@@ -110,59 +110,50 @@ def _base_sample() -> Sample:
     )
 
 
-async def _longds_agent(env: dict) -> int:
-    """Stand-in for ``claude -p --resume`` in a LongDS multi-turn task.
+def _make_longds_agent(turn_answers: list[str]):
+    """Return an on_launch callback. Each invocation = one LongDS turn.
 
-    Sends 2 turns to the AnthropicAdapter over real HTTP loopback,
-    each time including the full conversation history in the messages
-    array — exactly like Claude Code does with --resume.
-
-    Also writes answer.json so generate() can compute rewards.
+    The agent sends ONE Anthropic Messages request. On turn 2+ the
+    messages array includes the assistant response from turn 1 — exactly
+    replicating the full-history behavior of ``claude -p --resume``.
     """
-    base_url = env["ANTHROPIC_BASE_URL"]
-    token = env["ANTHROPIC_AUTH_TOKEN"]
-    workdir = env.get("WORKDIR", "/workspace")
+    call_count = [0]
+    history: list[dict] = []
 
-    system_msg = {"role": "system",
+    async def _agent(env: dict) -> int:
+        idx = call_count[0]
+        call_count[0] += 1
+        base_url = env["ANTHROPIC_BASE_URL"]
+        token = env["ANTHROPIC_AUTH_TOKEN"]
+
+        system = {"role": "system",
                   "content": [{"type": "text", "text": "You are a data scientist."}]}
+        turn_questions = [
+            [{"type": "text", "text": "Who scored the most goals?"}],
+            [{"type": "text", "text": "What is the Pearson r?"}],
+        ]
 
-    # ── Turn 1 ──────────────────────────────────────────────────────────
-    t1_user = {"role": "user",
-               "content": [{"type": "text", "text": "Who scored the most goals?"}]}
-    t1_messages = [system_msg, t1_user]
+        # messages = system + accumulated history + current question
+        messages = [system] + list(history)
+        if idx < len(turn_questions):
+            messages.append({"role": "user", "content": turn_questions[idx]})
 
-    async with aiohttp.ClientSession(trust_env=False) as sess:
-        async with sess.post(
-            f"{base_url}/v1/messages",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"model": "m", "max_tokens": 64, "messages": t1_messages},
-        ) as r:
-            t1_data = await r.json()
+        async with aiohttp.ClientSession(trust_env=False) as sess:
+            async with sess.post(
+                f"{base_url}/v1/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"model": "m", "max_tokens": 64, "messages": messages},
+            ) as r:
+                data = await r.json()
 
-    t1_assistant = {"role": "assistant", "content": t1_data["content"]}
+        # Record in accumulated history for the next turn
+        if idx < len(turn_questions):
+            history.append({"role": "user", "content": turn_questions[idx]})
+        history.append({"role": "assistant", "content": data["content"]})
 
-    # Write turn 1 answer (simulate Claude Code's Bash tool)
-    # Use the sandbox files dict — but in FakeSandbox, we need to find the
-    # sandbox instance. Since this runs inside on_launch, the fake sandbox
-    # writes to its own files dict. But we don't have access to it here.
-    # Instead, generate() reads answer.json from sandbox. The FakeSandbox
-    # records write_file calls. We'll pre-seed the answer.
-    # For now, we just return 0 and let the test pre-seed answer.json.
+        return 0
 
-    # ── Turn 2 (with full history, like --resume does) ──────────────────
-    t2_user = {"role": "user",
-               "content": [{"type": "text", "text": "What is the Pearson r?"}]}
-    t2_messages = [system_msg, t1_user, t1_assistant, t2_user]
-
-    async with aiohttp.ClientSession(trust_env=False) as sess:
-        async with sess.post(
-            f"{base_url}/v1/messages",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"model": "m", "max_tokens": 64, "messages": t2_messages},
-        ) as r:
-            await r.json()
-
-    return 0
+    return _agent
 
 
 def _two_turn_script():
@@ -211,32 +202,45 @@ def _patch_generate(monkeypatch, tokenizer: FakeTokenizer, sandbox_factory) -> N
 # ======================================================================
 
 
+def _make_sandbox_factory(turn_answers: list[str]):
+    """Build a FakeSandbox factory with LongDS agent + answer pre-seeding.
+
+    The on_launch callback:
+    1. Sends one Anthropic Messages request to the adapter
+    2. Writes the corresponding answer.json into the sandbox files
+    This simulates one ``claude -p`` invocation per LongDS turn.
+    """
+    agent = _make_longds_agent(turn_answers)
+    call_count = [0]
+
+    def factory(image="fake", **_kw):
+        sb = FakeSandbox(image)
+
+        async def _agent_and_write(env):
+            idx = call_count[0]
+            call_count[0] += 1
+            code = await agent(env)
+            # Write answer.json after the agent completes (simulating CC's Bash tool)
+            if idx < len(turn_answers):
+                sb.files["/workspace/answer.json"] = turn_answers[idx]
+            return code
+
+        sb.on_launch = _agent_and_write
+        return sb
+
+    return factory
+
+
 def test_multi_turn_chain_has_correct_loss_mask():
     """2-turn LongDS → 1 Sample with assistant tokens in loss_mask=1."""
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
-
-        # Pre-seed answer.json for both turns
         turn_answers = [
             json.dumps({"answer": "Kylian Mbappe", "reasoning": "checked data"}),
             json.dumps({"answer": "0.4521", "reasoning": "computed r"}),
         ]
-        call_count = [0]
 
-        def sandbox_factory(image="fake", **_kw):
-            sb = FakeSandbox(image)
-            # -- on_launch: the agent dials the adapter, then writes answer --
-            async def _agent_and_write(env):
-                idx = call_count[0]
-                call_count[0] += 1
-                code = await _longds_agent(env)
-                if idx < len(turn_answers):
-                    sb.files["/workspace/answer.json"] = turn_answers[idx]
-                return code
-            sb.on_launch = _agent_and_write
-            return sb
-
-        _patch_generate(monkeypatch, tok, sandbox_factory)
+        _patch_generate(monkeypatch, tok, _make_sandbox_factory(turn_answers))
         samples = await gen.generate(
             _args(), _base_sample(), sampling_params={"max_new_tokens": 32},
         )
@@ -251,12 +255,10 @@ def test_multi_turn_chain_has_correct_loss_mask():
         assert s.reward == 1.0, f"Expected reward 1.0, got {s.reward}"
         assert s.metadata["grading_solved"] is True
 
-        # loss_mask must have 1s (generated tokens) and 0s (prompt/injected tokens)
         mask = s.loss_mask
         assert 1 in mask, "loss_mask should contain trainable tokens"
         assert 0 in mask, "loss_mask should contain context-only tokens"
 
-        # The response string should contain both answers (decoded from token ids)
         decoded = s.response
         assert isinstance(decoded, str) and len(decoded) > 0
 
@@ -278,26 +280,12 @@ def test_partial_reward_trajectory():
     """1 correct + 1 wrong → reward 0.5, but trajectory still valid."""
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
-
         turn_answers = [
             json.dumps({"answer": "Kylian Mbappe", "reasoning": "correct"}),
             json.dumps({"answer": "wrong answer", "reasoning": "bad"}),
         ]
-        call_count = [0]
 
-        def sandbox_factory(image="fake", **_kw):
-            sb = FakeSandbox(image)
-            async def _agent_and_write(env):
-                idx = call_count[0]
-                call_count[0] += 1
-                code = await _longds_agent(env)
-                if idx < len(turn_answers):
-                    sb.files["/workspace/answer.json"] = turn_answers[idx]
-                return code
-            sb.on_launch = _agent_and_write
-            return sb
-
-        _patch_generate(monkeypatch, tok, sandbox_factory)
+        _patch_generate(monkeypatch, tok, _make_sandbox_factory(turn_answers))
         samples = await gen.generate(
             _args(), _base_sample(), sampling_params={"max_new_tokens": 32},
         )
@@ -325,7 +313,7 @@ def test_abort_on_empty_turns():
         bad_sample = _base_sample()
         bad_sample.metadata["turns"] = []
 
-        _patch_generate(monkeypatch, tok, FakeSandbox.factory())
+        _patch_generate(monkeypatch, tok, _make_sandbox_factory([]))
         samples = await gen.generate(
             _args(), bad_sample, sampling_params={"max_new_tokens": 32},
         )
