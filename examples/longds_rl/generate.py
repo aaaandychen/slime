@@ -135,7 +135,7 @@ async def generate(
         max_context_tokens=state.max_context_len,
     )
 
-    workdir = tempfile.mkdtemp(prefix=f"longds_{instance_id}_")
+    workdir = tempfile.mkdtemp(prefix=f"longds_{instance_id.replace('/', '_')}_")
     _prepare_workspace(workdir, md)
 
     t0 = time.time()
