@@ -10,14 +10,14 @@
 
 set -ex
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+
 # Best-effort cleanup
 pkill -9 sglang || true
 sleep 3
-ray stop --force || true
+${SLIME_DIR}/.venv/bin/ray stop --force || true
 sleep 3
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 # ============ model ============
 HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v3}"
@@ -156,11 +156,11 @@ ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
 ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
 TRAIN_GPUS_PER_NODE="${TRAIN_GPUS_PER_NODE:-4}"
 
-ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
+${SLIME_DIR}/.venv/bin/ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${ACTOR_NUM_GPUS_PER_NODE}" \
    --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 sleep 10
-ray status
+${SLIME_DIR}/.venv/bin/ray status
 
 # ============ runtime env → Ray workers ============
 export SLIME_DIR
@@ -186,7 +186,7 @@ print(json.dumps({"env_vars": env}))
 PY
 )
 
-ray job submit --address="http://127.0.0.1:8265" \
+${SLIME_DIR}/.venv/bin/ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- /mnt/cephfs/chenzhenyang/czy/slime/.venv/bin/python3 -u train.py \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
