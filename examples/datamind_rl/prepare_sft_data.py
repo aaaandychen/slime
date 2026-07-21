@@ -161,7 +161,7 @@ def build_sharegpt_conversation(row) -> dict | None:
             answer = _extract_answer(content)
 
             if answer:
-                # Final answer: echo to answer.json (matching RL generate.py expectation)
+                # Final answer: write answer.json via echo
                 escaped = answer.replace("\\", "\\\\").replace("'", "'\\''")
                 answer_cmd = f"echo '{{\"answer\":\"{escaped}\",\"reasoning\":\"done\"}}' > answer.json"
                 messages.append({"role": "assistant", "content": f"```bash\n{answer_cmd}\n```"})
