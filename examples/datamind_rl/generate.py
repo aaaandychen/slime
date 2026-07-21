@@ -32,21 +32,21 @@ logger = logging.getLogger(__name__)
 
 # ── System prompt that Claude Code will wrap into a session ────────────
 SYSTEM_PROMPT = """\
-You are an expert data analyst. Given a data analysis task and data files in the `data/` directory, solve it thoroughly.
+You are an expert data analyst. Given a data analysis task and data files in the `data/` directory, inspect the data, run analysis, and produce the final answer.
 
 **Workflow**:
-1. Read and understand the data files using the Read tool.
-2. Write Python or SQL code to analyze the data. Save results to output files.
-3. Fix any errors by re-reading the data or adjusting your code.
-4. When done, write the final answer with Bash:
+1. Start by inspecting the data: for SQL tasks call `get_db_info()`; for CSV tasks read a sample with `head`.
+2. Write and execute your analysis code.
+3. After each execution, judge: "Do I already have the information needed to answer?" If yes, immediately output the answer. If the code failed or the result is unexpected, you may fix and retry, but avoid re-running queries that already succeeded.
+4. When ready, write the final answer:
    echo '{"answer":"<your final answer>","reasoning":"<brief method>"}' > answer.json
 
 **Rules**:
 - Do NOT modify files under `data/`.
-- Use `python3 -c "..."` for one-liners or write a .py file for complex code.
-- Install packages with `pip install --quiet <package>` if needed.
-- For SQL queries, use sqlite3 or duckdb.
-- The final answer.json is required. Keep answers concise."""
+- Do NOT repeat the same query or file inspection once you already have the result.
+- If you find yourself exploring without making progress, stop and provide your best answer based on what you already know.
+- For SQL queries, use `sqlite3` or `python3` with the database.
+- The final answer.json is required to complete the task."""
 
 
 @dataclass(frozen=True)
@@ -174,7 +174,7 @@ async def generate(
     samples = await state.adapter.finish_session(
         session_id,
         base_sample=base_sample,
-        reward=0.0,  # Will be replaced by custom reward function
+        reward=None,
         extra_metadata={
             "instance_id": instance_id,
             "answer": answer,
@@ -196,6 +196,19 @@ async def generate(
 
 
 # ── Workspace & execution ────────────────────────────────────────────
+
+
+def _ensure_claude_perms() -> None:
+    """Ensure the claude user can access the claude binary and its native deps.
+
+    Called before every rollout to protect against Claude Code auto-updates
+    that create new files without world-readable permissions.
+    """
+    try:
+        subprocess.run(["chmod", "-R", "o+rX", "/root/.nvm"], capture_output=True, timeout=10)
+        subprocess.run(["chmod", "-R", "o+rX", "/root/.cache"], capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 
 def _ensure_workdir_perms(workdir: str) -> None:
@@ -236,7 +249,8 @@ def _run_claude_code(
 ) -> int:
     # Claude Code refuses --dangerously-skip-permissions as root.
     # Run via sudo to the 'claude' user instead.
-    # Ensure workspace is accessible.
+    # Ensure claude user can access the binary and workspace.
+    _ensure_claude_perms()
     _ensure_workdir_perms(workdir)
 
     cmd = [

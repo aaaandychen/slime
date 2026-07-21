@@ -20,11 +20,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 # ============ model ============
-HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct}"
-REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_torch_dist}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v3}"
+REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v3_torch_dist}"
 
 # ============ data ============
-PROMPT_DATA="${PROMPT_DATA:-/mnt/cephfs/chenzhenyang/datasets/DataMind-Data/rl/train.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-/mnt/cephfs/chenzhenyang/datasets/DataMind-Data/rl/train_sql.jsonl}"
 DATAMIND_DATA_ROOT="${DATAMIND_DATA_ROOT:-/mnt/cephfs/chenzhenyang/datasets/DataMind-Data/rl/train_files}"
 
 # ============ model parallelism ============
@@ -65,14 +65,15 @@ ROLLOUT_ARGS=(
    --label-key label
    --metadata-key metadata
    --num-rollout 500
-   --rollout-batch-size 32
+   --rollout-batch-size 16
    --n-samples-per-prompt 4
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 0.7
    --rollout-top-p 1.0
    --num-steps-per-rollout 1
-   --global-batch-size 128
+   --global-batch-size 64
+   --sglang-server-concurrency 64
    --micro-batch-size 1
    --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
 )
@@ -100,6 +101,7 @@ ALGO_ARGS=(
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
+   --clip-grad 5.0
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9

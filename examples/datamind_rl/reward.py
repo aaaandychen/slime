@@ -35,19 +35,27 @@ async def datamind_reward(args: Any, samples: list) -> float:
     # slime passes a list of samples; take the last one with metadata
     if isinstance(samples, list):
         if not samples:
-            return 0.0
+            return [0.0]
         sample = samples[-1]
     else:
         sample = samples
     md = sample.metadata or {}
-    answer = str(md.get("answer", ""))
     reasoning = str(md.get("reasoning", ""))
     ground_truth = str(md.get("ground_truth", ""))
     data_source = str(md.get("data_source", ""))
 
-    # Build a synthetic "full response" from the trajectory tokens when available,
-    # otherwise fall back to response string.
-    full_response = _extract_full_response(sample)
+    # Extract answer from model response (not answer.json — SFT model uses <answer> tags)
+    full_response = getattr(sample, "response", "") or str(md.get("answer", ""))
+    extracted_answer = _extract_answer_from_response(sample)
+    answer = extracted_answer or str(md.get("answer", ""))
+    logger.warning("DEBUG_REWARD: sid=%s n_samples=%d resp_len=%d answer_json_len=%d answer_extract_len=%d resp_tail=%s full_resp=%s",
+        getattr(sample, "session_id", "?") or "?",
+        len(samples) if isinstance(samples, list) else 1,
+        len(full_response),
+        len(str(md.get("answer", ""))),
+        len(extracted_answer),
+        full_response[-300:],
+        full_response if len(full_response) <= 2000 else full_response[:2000] + "…")
 
     template_score = _evaluate_template(full_response)
     answer_score = _evaluate_answer(answer, ground_truth, data_source)
@@ -63,12 +71,23 @@ async def datamind_reward(args: Any, samples: list) -> float:
 
     final_score = max(-1.0, min(1.0, final_score))
 
+    # Length penalty: discourage long exploration without producing an answer
+    length_penalty = 0.0
+    if answer_score <= 0:
+        resp_len = len(full_response)
+        threshold = 4000
+        if resp_len > threshold:
+            length_penalty = 0.3 * min(1.0, (resp_len - threshold) / 8192)
+            final_score -= length_penalty
+            final_score = max(-1.0, final_score)
+
     logger.info(
-        "datamind_reward: instance=%s answer=%.2f template=%.2f tool=%.2f final=%.2f gt_snippet=%s",
+        "datamind_reward: instance=%s answer=%.2f template=%.2f tool=%.2f len_pen=%.3f final=%.2f gt_snippet=%s",
         md.get("instance_id", "?"),
         answer_score,
         template_score,
         tool_score,
+        length_penalty,
         final_score,
         ground_truth[:100],
     )
@@ -81,6 +100,9 @@ async def datamind_reward(args: Any, samples: list) -> float:
         "reward_tool_score": tool_score,
     }
 
+    # slime expects a list of floats, one per sample
+    if isinstance(samples, list):
+        return [final_score] * len(samples)
     return final_score
 
 
@@ -128,13 +150,15 @@ def _evaluate_template(full_response: str) -> float:
 def _evaluate_answer(answer: str, ground_truth: str, data_source: str = "") -> float:
     """Compare the model's answer against ground truth.
 
-    Returns:
-        1.0 for exact match, 0.5 for partial, -1.0 for wrong/missing.
+    Uses multi-level comparison:
+      1. Exact match after normalization
+      2. Key number overlap (how many ground-truth numbers appear in the answer)
+      3. Substring containment for descriptive answers
+      4. Fuzzy token overlap for semantic similarity
     """
     if not answer.strip():
         return -1.0
     if not ground_truth.strip():
-        logger.warning("datamind_reward: empty ground_truth, cannot evaluate answer")
         return 0.0
 
     a = _normalize(answer)
@@ -144,28 +168,42 @@ def _evaluate_answer(answer: str, ground_truth: str, data_source: str = "") -> f
     if a == g:
         return 1.0
 
-    # Containment: answer contains the ground truth or vice versa
-    if len(a) > 5 and len(g) > 5:
-        if g in a or a in g:
-            return 0.8
+    # Extract numbers from both
+    a_nums = set(_extract_numbers(answer))
+    g_nums = set(_extract_numbers(ground_truth))
 
-    # Numeric comparison: try to extract numbers
-    a_nums = _extract_numbers(answer)
-    g_nums = _extract_numbers(ground_truth)
-    if a_nums and g_nums:
+    # Numeric overlap: what fraction of ground-truth numbers are in the answer?
+    if g_nums:
         if a_nums == g_nums:
             return 1.0
-        if len(a_nums) == len(g_nums) and all(abs(x - y) < 1e-3 for x, y in zip(a_nums, g_nums)):
-            return 1.0
-        if any(abs(x - y) < 1e-3 for x in a_nums for y in g_nums):
+        overlap = len(g_nums & a_nums)
+        ratio = overlap / len(g_nums)
+        if ratio >= 0.8:
+            return 0.8
+        elif ratio >= 0.5:
             return 0.5
+        elif ratio >= 0.2:
+            return 0.3
 
-    # Fuzzy string match for text answers
-    ratio = difflib.SequenceMatcher(None, a, g).ratio()
-    if ratio > 0.95:
-        return 1.0
-    if ratio > 0.7:
-        return 0.5
+    # Semantic containment: check if key ground-truth sentences appear in answer
+    g_sentences = [s.strip() for s in re.split(r'[.;]\s*', ground_truth) if len(s.strip()) > 10]
+    if g_sentences:
+        matches = sum(1 for gs in g_sentences if _normalize(gs)[:30] in a)
+        sentence_ratio = matches / len(g_sentences)
+        if sentence_ratio >= 0.6:
+            return 0.6
+        elif sentence_ratio >= 0.3:
+            return 0.3
+
+    # Token overlap for semantic similarity (more robust than char-level)
+    a_tokens = set(re.findall(r'\w+', a.lower()))
+    g_tokens = set(re.findall(r'\w+', g.lower()))
+    if g_tokens and len(g_tokens) > 5:
+        token_overlap = len(g_tokens & a_tokens) / len(g_tokens)
+        if token_overlap > 0.6:
+            return 0.3
+        if token_overlap > 0.4:
+            return 0.1
 
     return -1.0
 
@@ -187,17 +225,42 @@ def _evaluate_tool_usage(full_response: str) -> int:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-def _extract_full_response(sample: Any) -> str:
-    """Reconstruct the full text response from sample data."""
-    response = getattr(sample, "response", "")
-    if response:
-        return response
+def _extract_answer_from_response(sample: Any) -> str:
+    """Extract just the final answer from the model's response text.
 
+    Tries multiple strategies, ordered by priority:
+      1. <answer> tags (SFT format from teacher trajectories)
+      2. answer.json content from metadata
+      3. Last meaningful paragraph from the response
+    """
+    response = getattr(sample, "response", "")
     md = sample.metadata or {}
+
+    # 1. Look for <answer> tags in the response (SFT model uses this format)
+    if response:
+        m = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+
+    # 2. Look for JSON answer in the response (Claude Code format)
+    if response:
+        m = re.search(r'"answer"\s*:\s*"([^"]*)"', response)
+        if m:
+            return m.group(1).strip()
+
+    # 3. Fall back to metadata answer
     answer = str(md.get("answer", ""))
-    reasoning = str(md.get("reasoning", ""))
-    if reasoning or answer:
-        return f"{reasoning}\n\n{answer}"
+    if answer.strip():
+        return answer.strip()
+
+    # 4. Last resort: last non-empty paragraph before any tool call
+    if response:
+        # Strip tool calls and take the last substantial text block
+        clean = re.sub(r"<tool_call>.*?</tool_call>", "", response, flags=re.DOTALL)
+        clean = re.sub(r"```[^`]*```", "", clean)
+        paragraphs = [p.strip() for p in clean.split("\n\n") if len(p.strip()) > 20]
+        if paragraphs:
+            return paragraphs[-1]
 
     return ""
 

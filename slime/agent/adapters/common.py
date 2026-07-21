@@ -350,7 +350,7 @@ class BaseAdapter:
                 tool_parser_name=self.tool_parser,
                 reasoning_parser_name=self.reasoning_parser,
             )
-            reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
+            reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema, sid=sid)
             turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
 
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
@@ -464,8 +464,8 @@ async def call_sglang_generate(
                 len(prompt_ids),
                 session.max_context_tokens,
             )
-            return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
-        sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
+            return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="stop")
+        sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context - 1)
 
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
@@ -492,6 +492,10 @@ async def call_sglang_generate(
                     r.status,
                     text,
                 )
+                # Context overflow is non-retriable: return empty generation so
+                # the client stops sending requests instead of looping forever.
+                if "exceeds the model's maximum context length" in text:
+                    return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="stop")
                 raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
             data = await r.json(content_type=None)
         meta = data.get("meta_info") or {}

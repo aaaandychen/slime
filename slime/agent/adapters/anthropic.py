@@ -45,6 +45,12 @@ class AnthropicAdapter(BaseAdapter):
     max_token_keys = ("max_tokens",)
     stop_keys = ("stop_sequences",)
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # Per-session code accumulator: replays past function definitions so
+        # the model can define a function in one turn and call it in later turns.
+        self._code_cache: dict[str, list[str]] = {}
+
     def _register_routes(self, app: web.Application) -> None:
         app.router.add_post("/v1/messages", self._run_turn)
         app.router.add_post("/v1/messages/count_tokens", _count_tokens)
@@ -60,8 +66,19 @@ class AnthropicAdapter(BaseAdapter):
         tools_schema = _tools_to_chat_tools(body.get("tools"))
         return translated, tools_schema
 
-    def _build_reply(self, parsed, raw_finish, translated, tools_schema) -> Reply:
-        blocks, stop_reason, manager_message = _build_reply_parts(parsed, raw_finish)
+    async def finish_session(self, sid, *, base_sample, reward=0.0, extra_metadata=None, wait_timeout=5.0) -> list:
+        samples = await super().finish_session(sid, base_sample=base_sample, reward=reward, extra_metadata=extra_metadata, wait_timeout=wait_timeout)
+        self._code_cache.pop(sid, None)
+        return samples
+
+    async def drop_session(self, sid, *, wait_timeout=5.0) -> None:
+        await super().drop_session(sid, wait_timeout=wait_timeout)
+        self._code_cache.pop(sid, None)
+
+    def _build_reply(self, parsed, raw_finish, translated, tools_schema, sid="") -> Reply:
+        blocks, stop_reason, manager_message = _build_reply_parts(
+            parsed, raw_finish, code_cache=self._code_cache, sid=sid,
+        )
         return Reply(
             manager_message=manager_message,
             finish_reason=manager_finish_reason(parsed.tool_uses, raw_finish),
@@ -143,10 +160,99 @@ def _tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] | None:
 
 # --- Reply building: parsed output -> Anthropic blocks + manager_message ---
 
+import re as _re
+
+# Injected into Bash tool calls when the model uses DataMind-specific functions
+_GET_DB_INFO_DEF = """
+def get_db_info():
+    \"\"\"Display database schema.\"\"\"
+    import sqlite3, os
+    for f in sorted(os.listdir('data/files')):
+        if f.endswith('.sqlite'):
+            conn = sqlite3.connect(os.path.join('data/files', f))
+            for row in conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"):
+                print(row[0])
+            conn.close()
+""".strip()
+
+_EXECUTE_SQL_DEF = """
+def execute_sql(sql, output_path):
+    \"\"\"Execute SQL and save results to CSV.\"\"\"
+    import sqlite3, os, csv
+    for f in sorted(os.listdir('data/files')):
+        if f.endswith('.sqlite'):
+            conn = sqlite3.connect(os.path.join('data/files', f))
+            cur = conn.execute(sql)
+            rows = cur.fetchall()
+            if rows:
+                cols = [d[0] for d in cur.description]
+                os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+                with open(output_path, 'w', newline='') as fp:
+                    w = csv.writer(fp)
+                    w.writerow(cols)
+                    w.writerows(rows)
+                print(f'Output saved to: {output_path}')
+                for row in rows:
+                    print(','.join(str(x) for x in row))
+            else:
+                print(f'Output saved to: {output_path}')
+                print('(empty result)')
+            conn.close()
+            break
+""".strip()
+
+_MARKDOWN_CODE_RE = _re.compile(r'```(?:bash|python|sql|sh)?\s*\n(.*?)```', _re.DOTALL)
+_EOS_CLEANUP_RE = _re.compile(r'<\|\s*im_end\s*\|>|<\|endoftext\|>')
+
+
+_HEREDOC_RE = _re.compile(r"python3?\s*<<\s*['\"]?PYEOF['\"]?\s*\n(.*?)PYEOF", _re.DOTALL)
+
+
+def _extract_python_code(code: str) -> str:
+    """Extract just the Python expression from a shell command.
+
+    Handles ``python3 -c "..."`` and heredoc (``python3 << 'PYEOF' ... PYEOF``).
+    Plain Python passes through unchanged.
+    """
+    code = code.strip()
+    # python3 << 'PYEOF'\n...\nPYEOF
+    m = _HEREDOC_RE.search(code)
+    if m:
+        return m.group(1).strip()
+    # python3 -c "..." or python3 -c '...'
+    m = _re.match(r'^python3?\s+-c\s+["\'](.+?)["\']$', code, _re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return code
+
+
+def _wrap_heredoc(code: str) -> str:
+    """Wrap Python code in a bash heredoc invocation."""
+    code = code.strip()
+    if _re.search(r'<<\s*["\']?PYEOF', code):
+        return code  # already a heredoc
+    return "python3 << 'PYEOF'\n" + code + '\nPYEOF'
+
+
+def _inject_functions(code: str) -> str:
+    """Prepend DataMind function definitions only if the model did not already
+    include them (SFT v3+ teaches self-contained definitions)."""
+    parts = []
+    if 'get_db_info()' in code and 'def get_db_info()' not in code:
+        parts.append(_GET_DB_INFO_DEF)
+    if 'execute_sql(' in code and 'def execute_sql' not in code:
+        parts.append(_EXECUTE_SQL_DEF)
+    if not parts:
+        return code
+    return '\n\n'.join(parts) + '\n\n' + code
+
 
 def _build_reply_parts(
     parsed: ParsedModelOutput,
     finish: str,
+    *,
+    code_cache: dict[str, list[str]] | None = None,
+    sid: str = "",
 ) -> tuple[list[dict], str, dict[str, Any]]:
     """Return (anthropic blocks, wire stop_reason, manager_message).
 
@@ -158,7 +264,10 @@ def _build_reply_parts(
     if parsed.reasoning:
         blocks.append({"type": "thinking", "thinking": parsed.reasoning})
     if parsed.text:
-        blocks.append({"type": "text", "text": parsed.text})
+        # Clean leaked EOS tokens from the visible text
+        clean_text = _EOS_CLEANUP_RE.sub('', parsed.text)
+        if clean_text.strip():
+            blocks.append({"type": "text", "text": clean_text})
 
     manager_tcs: list[dict] = []
     for tu in parsed.tool_uses:
@@ -167,10 +276,33 @@ def _build_reply_parts(
         # tu_id is wire-only; tool_call_dict drops it so the leaf matches its echo
         manager_tcs.append(tool_call_dict(tu["name"], tu.get("input")))
 
+    # If the parser didn't find any tool_use but the model output contains
+    # markdown code blocks (common after DataMind SFT), convert them to Bash
+    # tool_use blocks so Claude Code executes them and continues the loop.
+    if not parsed.tool_uses and parsed.text:
+        code_blocks = _MARKDOWN_CODE_RE.findall(parsed.text)
+        if code_blocks:
+            for code in code_blocks:
+                current = _extract_python_code(code.strip())
+                # Replay past definitions so functions persist across tool calls
+                to_run = current
+                if code_cache is not None and sid:
+                    history = code_cache.get(sid, [])
+                    if history:
+                        to_run = "\n".join(history) + "\n" + current
+                to_run = _inject_functions(to_run)
+                command = _wrap_heredoc(to_run)
+                # Cache the current code for future turns
+                if code_cache is not None and sid:
+                    code_cache.setdefault(sid, []).append(current)
+                tu_id = f"toolu_{secrets.token_hex(8)}"
+                blocks.append({"type": "tool_use", "id": tu_id, "name": "Bash", "input": {"command": command}})
+                manager_tcs.append(tool_call_dict("Bash", {"command": command}))
+
     if not blocks:
         blocks.append({"type": "text", "text": ""})
 
-    if parsed.tool_uses:
+    if manager_tcs:
         stop_reason = "tool_use"
     elif finish == "length":
         stop_reason = "max_tokens"
