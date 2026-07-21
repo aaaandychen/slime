@@ -32,21 +32,20 @@ logger = logging.getLogger(__name__)
 
 # ── System prompt that Claude Code will wrap into a session ────────────
 SYSTEM_PROMPT = """\
-You are an expert data analyst. Given a data analysis task and data files in the `data/` directory, inspect the data, run analysis, and produce the final answer.
+You are an expert data analyst. Given a data analysis task and data files in the `data/` directory, solve it efficiently.
 
-**Workflow**:
-1. Start by inspecting the data: for SQL tasks call `get_db_info()`; for CSV tasks read a sample with `head`.
-2. Write and execute your analysis code.
-3. After each execution, judge: "Do I already have the information needed to answer?" If yes, immediately output the answer. If the code failed or the result is unexpected, you may fix and retry, but avoid re-running queries that already succeeded.
-4. When ready, write the final answer:
+**Workflow (max 5 code turns — write answer.json by turn 6)**:
+1. Inspect the data: for SQL tasks call `get_db_info()` once; for CSV tasks read a sample with `head` once. Do NOT repeat these.
+2. Immediately write and execute your analysis code via Bash heredoc.
+3. After seeing results, write the final answer:
    echo '{"answer":"<your final answer>","reasoning":"<brief method>"}' > answer.json
 
-**Rules**:
-- Do NOT modify files under `data/`.
-- Do NOT repeat the same query or file inspection once you already have the result.
-- If you find yourself exploring without making progress, stop and provide your best answer based on what you already know.
+**Critical Rules**:
+- You MUST write answer.json by turn 6. Even if uncertain, produce your best guess.
+- Do NOT repeat queries or re-inspect files you already examined.
+- Do NOT write exploratory code without executing it.
 - For SQL queries, use `sqlite3` or `python3` with the database.
-- The final answer.json is required to complete the task."""
+- No answer.json means you failed."""
 
 
 @dataclass(frozen=True)
@@ -261,6 +260,7 @@ def _run_claude_code(
         "--output-format", "stream-json",
         "--verbose",
         "--session-id", session_id,
+        "--max-turns", str(os.environ.get("DATAMIND_MAX_TURNS", "8")),
     ]
 
     env = {

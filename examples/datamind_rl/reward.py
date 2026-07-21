@@ -62,12 +62,16 @@ async def datamind_reward(args: Any, samples: list) -> float:
     tool_score = _evaluate_tool_usage(full_response)
 
     # DataMind reward logic
+    # answer.json bonus: writing answer.json (even if wrong) beats text-only responses
+    has_answer_json = bool(str(md.get("answer", "")).strip())
+    answer_json_bonus = 0.15 if has_answer_json else 0.0
+
     if answer_score > 0.0:
         final_score = answer_score + 0.1 * template_score + 0.05 * tool_score
     elif template_score > 0.0:
-        final_score = 0.0 + 0.1 * template_score + 0.05 * tool_score  # partial credit for trying
+        final_score = 0.0 + 0.1 * template_score + 0.05 * tool_score + answer_json_bonus
     else:
-        final_score = -0.1
+        final_score = -0.1 + answer_json_bonus
 
     final_score = max(-1.0, min(1.0, final_score))
 
@@ -82,11 +86,12 @@ async def datamind_reward(args: Any, samples: list) -> float:
             final_score = max(-1.0, final_score)
 
     logger.info(
-        "datamind_reward: instance=%s answer=%.2f template=%.2f tool=%.2f len_pen=%.3f final=%.2f gt_snippet=%s",
+        "datamind_reward: instance=%s answer=%.2f template=%.2f tool=%.2f aj_bonus=%.2f len_pen=%.3f final=%.2f gt_snippet=%s",
         md.get("instance_id", "?"),
         answer_score,
         template_score,
         tool_score,
+        answer_json_bonus,
         length_penalty,
         final_score,
         ground_truth[:100],
