@@ -184,6 +184,14 @@ async def generate(
         },
     )
 
+    # Fallback: if answer.json wasn't written, extract answer from echo in response text
+    if not answer and samples:
+        extracted = _extract_answer_from_echo_response(samples)
+        if extracted:
+            answer = extracted
+            for s in samples:
+                s.metadata = {**(s.metadata or {}), "answer": answer}
+
     if not samples:
         return _abort(base_sample, "adapter_session_empty", instance_id)
 
@@ -289,6 +297,32 @@ def _run_claude_code(
     except subprocess.TimeoutExpired:
         logger.warning("datamind_rl: claude -p timeout after %ds", timeout)
         return -1
+
+
+def _extract_answer_from_echo_response(samples: list) -> str | None:
+    """Fallback: extract answer from ``echo '{"answer":"..."}' > answer.json`` in response text.
+
+    Handles bash single-quote escaping (``'\\''`` → ``'``).
+    """
+    echo_re = re.compile(r"""echo\s+(['"])\s*(.*?)\1\s*>\s*answer\.json""", re.DOTALL)
+    for s in samples:
+        resp = getattr(s, "response", "") or ""
+        if not resp:
+            continue
+        m = echo_re.search(resp)
+        if m:
+            json_str = m.group(2)
+            # Undo bash single-quote escaping
+            json_str = json_str.replace("'\\''", "'")
+            json_str = json_str.replace('"\\""', '"')
+            try:
+                payload = json.loads(json_str)
+                return str(payload.get("answer", ""))
+            except Exception:
+                am = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
+                if am:
+                    return am.group(1)
+    return None
 
 
 def _read_answer_json(workdir: str) -> dict:
