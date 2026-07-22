@@ -206,6 +206,15 @@ def _ensure_claude_perms() -> None:
     try:
         subprocess.run(["chmod", "-R", "o+rX", "/root/.nvm"], capture_output=True, timeout=10)
         subprocess.run(["chmod", "-R", "o+rX", "/root/.cache"], capture_output=True, timeout=10)
+        # Fix ownership of claude binary directory so claude user can write during postinstall
+        claude_dir = "/root/.nvm/versions/node/v22.23.1/lib/node_modules/@anthropic-ai/claude-code"
+        subprocess.run(["chown", "-R", "claude:claude", f"{claude_dir}/bin"], capture_output=True, timeout=5)
+        subprocess.run(
+            ["sudo", "-E", "-u", "claude", "env",
+             "PATH=/root/.nvm/versions/node/v22.23.1/bin:/usr/bin:/bin",
+             "node", f"{claude_dir}/install.cjs"],
+            capture_output=True, timeout=15,
+        )
     except Exception:
         pass
 
