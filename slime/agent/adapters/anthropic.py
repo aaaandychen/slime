@@ -280,6 +280,8 @@ def _build_reply_parts(
         # Intercept echo '...' > answer.json in tool_use Bash commands
         command = tu_input.get("command", "")
         if command:
+            if "answer.json" in command:
+                logger.warning("[anthropic_adapter] tool_use command contains answer.json: %.200s", command)
             m = _ANSWER_JSON_ECHO_RE.search(command)
             if m:
                 json_str = m.group(2)
@@ -307,6 +309,8 @@ def _build_reply_parts(
         if code_blocks:
             for code in code_blocks:
                 raw_code = code.strip()
+                if "answer.json" in raw_code:
+                    logger.warning("[anthropic_adapter] code_block contains answer.json: %.200s", raw_code)
                 # Intercept echo '...' > answer.json — convert to python3 heredoc to avoid shell escaping issues
                 m = _ANSWER_JSON_ECHO_RE.search(raw_code)
                 if m:
