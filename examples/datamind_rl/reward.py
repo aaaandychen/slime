@@ -44,10 +44,10 @@ async def datamind_reward(args: Any, samples: list) -> float:
     ground_truth = str(md.get("ground_truth", ""))
     data_source = str(md.get("data_source", ""))
 
-    # Extract answer from model response (not answer.json — SFT model uses <answer> tags)
+    # Extract answer: answer.json takes priority over response text extraction
     full_response = getattr(sample, "response", "") or str(md.get("answer", ""))
     extracted_answer = _extract_answer_from_response(sample)
-    answer = extracted_answer or str(md.get("answer", ""))
+    answer = str(md.get("answer", "")) or extracted_answer
     logger.warning("DEBUG_REWARD: sid=%s n_samples=%d resp_len=%d answer_json_len=%d answer_extract_len=%d resp_tail=%s full_resp=%s",
         getattr(sample, "session_id", "?") or "?",
         len(samples) if isinstance(samples, list) else 1,
