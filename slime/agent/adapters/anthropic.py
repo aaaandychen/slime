@@ -206,6 +206,11 @@ _EOS_CLEANUP_RE = _re.compile(r'<\|\s*im_end\s*\|>|<\|endoftext\|>')
 
 
 _HEREDOC_RE = _re.compile(r"python3?\s*<<\s*['\"]?PYEOF['\"]?\s*\n(.*?)PYEOF", _re.DOTALL)
+# Intercept echo '{"answer":"..."}' > answer.json — fragile in shell, convert to python3 heredoc
+_ANSWER_JSON_RE = _re.compile(
+    r"""echo\s+(['"])\s*\{.*?"answer"\s*:\s*"(.+?)"\s*[,}].*?\1\s*>\s*answer\.json""",
+    _re.DOTALL,
+)
 
 
 def _extract_python_code(code: str) -> str:
@@ -283,7 +288,15 @@ def _build_reply_parts(
         code_blocks = _MARKDOWN_CODE_RE.findall(parsed.text)
         if code_blocks:
             for code in code_blocks:
-                current = _extract_python_code(code.strip())
+                raw_code = code.strip()
+                # Intercept echo '{"answer":"..."}' > answer.json — convert to python3 heredoc
+                m = _ANSWER_JSON_RE.search(raw_code)
+                if m:
+                    answer_text = m.group(2)
+                    import json as _json
+                    answer_json = _json.dumps({"answer": answer_text, "reasoning": "done"}, ensure_ascii=False)
+                    raw_code = f"python3 << 'PYEOF'\nimport json\njson.dump({answer_json}, open('answer.json', 'w'), ensure_ascii=False)\nPYEOF"
+                current = _extract_python_code(raw_code)
                 # Replay past definitions so functions persist across tool calls
                 to_run = current
                 if code_cache is not None and sid:
