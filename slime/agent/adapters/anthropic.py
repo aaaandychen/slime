@@ -206,9 +206,9 @@ _EOS_CLEANUP_RE = _re.compile(r'<\|\s*im_end\s*\|>|<\|endoftext\|>')
 
 
 _HEREDOC_RE = _re.compile(r"python3?\s*<<\s*['\"]?PYEOF['\"]?\s*\n(.*?)PYEOF", _re.DOTALL)
-# Intercept echo '{"answer":"..."}' > answer.json — fragile in shell, convert to python3 heredoc
-_ANSWER_JSON_RE = _re.compile(
-    r"""echo\s+(['"])\s*\{.*?"answer"\s*:\s*"(.+?)"\s*[,}].*?\1\s*>\s*answer\.json""",
+# Intercept echo '...' > answer.json — extract JSON payload, handle bash single-quote escaping
+_ANSWER_JSON_ECHO_RE = _re.compile(
+    r"""echo\s+(['"])\s*(.*?)\1\s*>\s*answer\.json""",
     _re.DOTALL,
 )
 
@@ -289,11 +289,19 @@ def _build_reply_parts(
         if code_blocks:
             for code in code_blocks:
                 raw_code = code.strip()
-                # Intercept echo '{"answer":"..."}' > answer.json — convert to python3 heredoc
-                m = _ANSWER_JSON_RE.search(raw_code)
+                # Intercept echo '...' > answer.json — convert to python3 heredoc to avoid shell escaping issues
+                m = _ANSWER_JSON_ECHO_RE.search(raw_code)
                 if m:
-                    answer_text = m.group(2)
-                    import json as _json
+                    json_str = m.group(2)
+                    # Undo bash single-quote escaping: '\'' -> '
+                    json_str = json_str.replace("'\\''", "'")
+                    json_str = json_str.replace('"\\""', '"')
+                    try:
+                        import json as _json
+                        payload = _json.loads(json_str)
+                        answer_text = payload.get("answer", json_str)
+                    except Exception:
+                        answer_text = json_str
                     answer_json = _json.dumps({"answer": answer_text, "reasoning": "done"}, ensure_ascii=False)
                     raw_code = f"python3 << 'PYEOF'\nimport json\njson.dump({answer_json}, open('answer.json', 'w'), ensure_ascii=False)\nPYEOF"
                 current = _extract_python_code(raw_code)
