@@ -213,6 +213,32 @@ _ANSWER_JSON_ECHO_RE = _re.compile(
 )
 
 
+def _convert_echo_to_answer_json(command: str) -> str | None:
+    """Convert ``echo '{"answer":"..."}' > answer.json`` to a robust python3 heredoc.
+
+    Returns the python3 heredoc command string, or None if no match.
+    """
+    m = _ANSWER_JSON_ECHO_RE.search(command)
+    if not m:
+        return None
+    # Extract the JSON payload between the outer echo quotes
+    json_str = m.group(2)
+    # Undo bash single-quote escaping: the '\'' dance -> '
+    json_str = json_str.replace("'\\''", "'")
+    json_str = json_str.replace('"\\""', '"')
+    # Try to parse the model's JSON; if invalid, extract answer field manually
+    try:
+        import json as _json
+        payload = _json.loads(json_str)
+        answer_text = payload.get("answer", json_str)
+    except Exception:
+        am = _re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
+        answer_text = am.group(1) if am else json_str
+    # Write valid JSON via python3 heredoc — same format as code execution blocks
+    answer_json = _json.dumps({"answer": answer_text, "reasoning": "done"}, ensure_ascii=False)
+    return f"python3 << 'PYEOF'\nimport json\njson.dump({answer_json}, open('answer.json', 'w'), ensure_ascii=False)\nPYEOF"
+
+
 def _extract_python_code(code: str) -> str:
     """Extract just the Python expression from a shell command.
 
@@ -280,21 +306,9 @@ def _build_reply_parts(
         # Intercept echo '...' > answer.json in tool_use Bash commands
         command = tu_input.get("command", "")
         if command:
-            if "answer.json" in command:
-                logger.warning("[anthropic_adapter] tool_use command contains answer.json: %.200s", command)
-            m = _ANSWER_JSON_ECHO_RE.search(command)
-            if m:
-                json_str = m.group(2)
-                json_str = json_str.replace("'\\''", "'")
-                json_str = json_str.replace('"\\""', '"')
-                try:
-                    import json as _json
-                    payload = _json.loads(json_str)
-                    answer_text = payload.get("answer", json_str)
-                except Exception:
-                    answer_text = json_str
-                answer_json = _json.dumps({"answer": answer_text, "reasoning": "done"}, ensure_ascii=False)
-                command = f"python3 << 'PYEOF'\nimport json\njson.dump({answer_json}, open('answer.json', 'w'), ensure_ascii=False)\nPYEOF"
+            new_cmd = _convert_echo_to_answer_json(command)
+            if new_cmd:
+                command = new_cmd
                 tu_input = {"command": command}
         tu_id = f"toolu_{secrets.token_hex(8)}"
         blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu_input})
@@ -309,23 +323,10 @@ def _build_reply_parts(
         if code_blocks:
             for code in code_blocks:
                 raw_code = code.strip()
-                if "answer.json" in raw_code:
-                    logger.warning("[anthropic_adapter] code_block contains answer.json: %.200s", raw_code)
-                # Intercept echo '...' > answer.json — convert to python3 heredoc to avoid shell escaping issues
-                m = _ANSWER_JSON_ECHO_RE.search(raw_code)
-                if m:
-                    json_str = m.group(2)
-                    # Undo bash single-quote escaping: '\'' -> '
-                    json_str = json_str.replace("'\\''", "'")
-                    json_str = json_str.replace('"\\""', '"')
-                    try:
-                        import json as _json
-                        payload = _json.loads(json_str)
-                        answer_text = payload.get("answer", json_str)
-                    except Exception:
-                        answer_text = json_str
-                    answer_json = _json.dumps({"answer": answer_text, "reasoning": "done"}, ensure_ascii=False)
-                    raw_code = f"python3 << 'PYEOF'\nimport json\njson.dump({answer_json}, open('answer.json', 'w'), ensure_ascii=False)\nPYEOF"
+                # Intercept echo '...' > answer.json → convert to python3 heredoc
+                new_cmd = _convert_echo_to_answer_json(raw_code)
+                if new_cmd:
+                    raw_code = new_cmd
                 current = _extract_python_code(raw_code)
                 # Replay past definitions so functions persist across tool calls
                 to_run = current
