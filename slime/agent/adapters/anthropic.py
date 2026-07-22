@@ -276,10 +276,28 @@ def _build_reply_parts(
 
     manager_tcs: list[dict] = []
     for tu in parsed.tool_uses:
+        tu_input = dict(tu.get("input", {}) or {})
+        # Intercept echo '...' > answer.json in tool_use Bash commands
+        command = tu_input.get("command", "")
+        if command:
+            m = _ANSWER_JSON_ECHO_RE.search(command)
+            if m:
+                json_str = m.group(2)
+                json_str = json_str.replace("'\\''", "'")
+                json_str = json_str.replace('"\\""', '"')
+                try:
+                    import json as _json
+                    payload = _json.loads(json_str)
+                    answer_text = payload.get("answer", json_str)
+                except Exception:
+                    answer_text = json_str
+                answer_json = _json.dumps({"answer": answer_text, "reasoning": "done"}, ensure_ascii=False)
+                command = f"python3 << 'PYEOF'\nimport json\njson.dump({answer_json}, open('answer.json', 'w'), ensure_ascii=False)\nPYEOF"
+                tu_input = {"command": command}
         tu_id = f"toolu_{secrets.token_hex(8)}"
-        blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]})
+        blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu_input})
         # tu_id is wire-only; tool_call_dict drops it so the leaf matches its echo
-        manager_tcs.append(tool_call_dict(tu["name"], tu.get("input")))
+        manager_tcs.append(tool_call_dict(tu["name"], tu_input))
 
     # If the parser didn't find any tool_use but the model output contains
     # markdown code blocks (common after DataMind SFT), convert them to Bash
