@@ -20,8 +20,8 @@ ${SLIME_DIR}/.venv/bin/ray stop --force || true
 sleep 3
 
 # ============ model ============
-HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v3}"
-REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v3_torch_dist}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v4}"
+REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/cephfs/chenzhenyang/models/Qwen2.5-Coder-14B-Instruct_datamind_sft_v4_torch_dist}"
 
 # ============ data ============
 PROMPT_DATA="${PROMPT_DATA:-/mnt/cephfs/chenzhenyang/datasets/DataMind-Data/rl/train_sql.jsonl}"
